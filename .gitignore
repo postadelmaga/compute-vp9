@@ -1,0 +1,22 @@
+# Build directories
+build/
+bin/
+lib/
+obj/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Compiled shaders
+*.spv
+
+# CMake temporary files
+CMakeCache.txt
+CMakeFiles/
+CMakeSheets/
+cmake_install.cmake
+Makefile
+targets/
