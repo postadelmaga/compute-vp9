@@ -273,10 +273,14 @@ int main(int argc, char **argv)
     double vk_start = get_time_ms();
     int vk_decoded_count = 0;
     f = 0;
+    
+    double vk_max_frame_ms = 0;
+    int vk_frame_drops_60fps = 0;
 
     if (duration_sec > 0) {
         double dur_ms = duration_sec * 1000.0;
         while ((get_time_ms() - vk_start) < dur_ms) {
+            double frame_start_time = get_time_ms();
             cvp9_err_t err;
             if (f == 0) {
                 err = cvp9_decode(vk_ctx, keyframe_buf, keyframe_size, f);
@@ -295,10 +299,15 @@ int main(int argc, char **argv)
             } else {
                 printf("[benchmark] cvp9_decode failed at frame %d: %s\n", f, cvp9_err_str(err));
             }
+            double frame_end_time = get_time_ms();
+            double f_time = frame_end_time - frame_start_time;
+            if (f_time > vk_max_frame_ms) vk_max_frame_ms = f_time;
+            if (f_time > 16.666) vk_frame_drops_60fps++;
             f++;
         }
     } else {
         for (f = 0; f < BENCHMARK_FRAMES; f++) {
+            double frame_start_time = get_time_ms();
             cvp9_err_t err;
             if (f == 0) {
                 err = cvp9_decode(vk_ctx, keyframe_buf, keyframe_size, f);
@@ -317,6 +326,10 @@ int main(int argc, char **argv)
             } else {
                 printf("[benchmark] cvp9_decode failed at frame %d: %s\n", f, cvp9_err_str(err));
             }
+            double frame_end_time = get_time_ms();
+            double f_time = frame_end_time - frame_start_time;
+            if (f_time > vk_max_frame_ms) vk_max_frame_ms = f_time;
+            if (f_time > 16.666) vk_frame_drops_60fps++;
         }
     }
     double vk_end = get_time_ms();
@@ -325,7 +338,9 @@ int main(int argc, char **argv)
 
     printf("  Decoded frames: %d\n", vk_decoded_count);
     printf("  Time taken:     %.2f ms\n", vk_time);
-    printf("  Throughput:     %.2f FPS\n\n", vk_fps);
+    printf("  Throughput:     %.2f FPS\n", vk_fps);
+    printf("  Max latency:    %.2f ms/frame\n", vk_max_frame_ms);
+    printf("  Frame drops:    %d (slower than 60fps limit)\n\n", vk_frame_drops_60fps);
 
     cvp9_destroy(vk_ctx);
     free(keyframe_buf);

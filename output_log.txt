@@ -1,0 +1,17 @@
+=================================================================
+         compute-vp9 Decoding Performance Benchmark             
+=================================================================
+Resolution: 3840x2160 | Duration: 1 seconds
+
+Running CPU Software Fallback Backend...
+[compute-vp9] WARNING: using CPU software fallback
+  Decoded frames: 2
+  Time taken:     1105.70 ms
+  Throughput:     1.81 FPS
+
+Running Vulkan Compute GPU Backend...
+[compute-vp9] Available Vulkan GPUs:
+  [0] NVIDIA GeForce 940MX (Vendor: NVIDIA, ID: 0x10DE, Type: 2)
+  [1] Intel(R) HD Graphics 520 (SKL GT2) (Vendor: Intel, ID: 0x8086, Type: 1)
+[compute-vp9] Selected Vulkan GPU: Intel(R) HD Graphics 520 (SKL GT2)
+EXIT_CODE: 139

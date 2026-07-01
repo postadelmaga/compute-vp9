@@ -10,79 +10,100 @@
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 32, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) buffer PredOut {
     uint8_t pred[];
 };
 
-layout(push_constant) uniform PushConst {
-    uint block_size;  /* 4, 8, 16, 32 */
-    uint pred_mode;   /* 0–9 */
+struct BlockData {
+    uint is_intra;
+    uint skip;
+    uint block_size;
+    uint tx_size;
+    
+    uint pred_mode;
+    int qstep;
+    uint coeff_offset;
     uint dst_stride;
+    
     uint dst_offset;
-} pc;
+    uint pad1;
+    uint pad2;
+    uint pad3;
+};
 
-uint sample_above(uint x) {
-    return uint(pred[pc.dst_offset - pc.dst_stride + x]);
+layout(set = 0, binding = 2, std430) readonly buffer BlockBuf {
+    BlockData blocks[];
+};
+
+uint sample_above(uint x, uint dst_offset, uint dst_stride) {
+    return uint(pred[dst_offset - dst_stride + x]);
 }
 
-uint sample_left(uint y) {
-    return uint(pred[pc.dst_offset - 1u + y * pc.dst_stride]);
+uint sample_left(uint y, uint dst_offset, uint dst_stride) {
+    return uint(pred[dst_offset - 1u + y * dst_stride]);
 }
 
-uint sample_top_left() {
-    return uint(pred[pc.dst_offset - pc.dst_stride - 1u]);
+uint sample_top_left(uint dst_offset, uint dst_stride) {
+    return uint(pred[dst_offset - dst_stride - 1u]);
 }
+
+shared uint shared_dc_val;
 
 void main()
 {
-    uvec2 pos = gl_GlobalInvocationID.xy;
-    if (pos.x >= pc.block_size || pos.y >= pc.block_size) return;
+    uint block_idx = gl_WorkGroupID.x;
+    BlockData b = blocks[block_idx];
+    
+    if (b.is_intra == 0) return;
+    
+    uvec2 pos = gl_LocalInvocationID.xy;
+    if (pos.x >= b.block_size || pos.y >= b.block_size) return;
 
     uint val = 128u; /* fallback: mid-grey */
 
-    bool has_above = (pc.dst_offset >= pc.dst_stride);
-    bool has_left = ((pc.dst_offset % pc.dst_stride) > 0u);
+    bool has_above = (b.dst_offset >= b.dst_stride);
+    bool has_left = ((b.dst_offset % b.dst_stride) > 0u);
 
-    switch (pc.pred_mode) {
+    switch (b.pred_mode) {
     case 0: { /* DC_PRED — average of above + left */
         if (has_above && has_left) {
             uint sum = 0u;
-            for (uint i = 0u; i < pc.block_size; i++) sum += sample_above(i);
-            for (uint i = 0u; i < pc.block_size; i++) sum += sample_left(i);
-            val = (sum + pc.block_size) / (pc.block_size * 2u);
+            for (uint i = 0u; i < b.block_size; i++) sum += sample_above(i, b.dst_offset, b.dst_stride);
+            for (uint i = 0u; i < b.block_size; i++) sum += sample_left(i, b.dst_offset, b.dst_stride);
+            val = (sum + b.block_size) / (b.block_size * 2u);
         } else if (has_above) {
             uint sum = 0u;
-            for (uint i = 0u; i < pc.block_size; i++) sum += sample_above(i);
-            val = (sum + pc.block_size / 2u) / pc.block_size;
+            for (uint i = 0u; i < b.block_size; i++) sum += sample_above(i, b.dst_offset, b.dst_stride);
+            val = (sum + b.block_size / 2u) / b.block_size;
         } else if (has_left) {
             uint sum = 0u;
-            for (uint i = 0u; i < pc.block_size; i++) sum += sample_left(i);
-            val = (sum + pc.block_size / 2u) / pc.block_size;
+            for (uint i = 0u; i < b.block_size; i++) sum += sample_left(i, b.dst_offset, b.dst_stride);
+            val = (sum + b.block_size / 2u) / b.block_size;
         } else {
             val = 128u;
         }
         break;
     }
     case 1: /* V_PRED — copy from above */
-        val = has_above ? sample_above(pos.x) : 128u;
+        val = has_above ? sample_above(pos.x, b.dst_offset, b.dst_stride) : 128u;
         break;
     case 2: /* H_PRED — copy from left */
-        val = has_left ? sample_left(pos.y) : 128u;
+        val = has_left ? sample_left(pos.y, b.dst_offset, b.dst_stride) : 128u;
         break;
     case 9: { /* TM_PRED — true motion */
-        uint top_left = (has_above && has_left) ? sample_top_left() : 128u;
-        uint a = has_above ? sample_above(pos.x) : 128u;
-        uint l = has_left ? sample_left(pos.y) : 128u;
+        uint top_left = (has_above && has_left) ? sample_top_left(b.dst_offset, b.dst_stride) : 128u;
+        uint a = has_above ? sample_above(pos.x, b.dst_offset, b.dst_stride) : 128u;
+        uint l = has_left ? sample_left(pos.y, b.dst_offset, b.dst_stride) : 128u;
         val = uint(clamp(int(a) + int(l) - int(top_left), 0, 255));
         break;
     }
     /* D45..D63: angular modes — TODO */
     default:
-        val = has_above ? sample_above(pos.x) : 128u;
+        val = has_above ? sample_above(pos.x, b.dst_offset, b.dst_stride) : 128u;
         break;
     }
 
-    pred[pc.dst_offset + pos.y * pc.dst_stride + pos.x] = uint8_t(val);
+    pred[b.dst_offset + pos.y * b.dst_stride + pos.x] = uint8_t(val);
 }

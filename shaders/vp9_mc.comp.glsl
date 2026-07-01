@@ -17,9 +17,7 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, std430) readonly buffer RefFrame {
-    uint8_t ref_luma[];
-};
+layout(set = 0, binding = 0) uniform sampler2D ref_frame;
 
 layout(set = 0, binding = 1, std430) writeonly buffer DstFrame {
     uint8_t dst_luma[];
@@ -32,31 +30,9 @@ layout(set = 0, binding = 2, std430) readonly buffer MotionVecs {
 layout(push_constant) uniform PushConst {
     uint frame_width;
     uint frame_height;
-    uint block_size;    /* 4, 8, 16, 32, 64 */
-    uint filter_type;   /* 0=bilinear, 1=8-tap, 2=smooth */
+    uint block_size;
+    uint filter_type;
 } pc;
-
-/* ── Bilinear interpolation helper ─────────────────────────────────────── */
-uint bilinear(uint x, uint y, ivec2 sub)
-{
-    /* sub is in 1/8 pixel units */
-    int fx = sub.x & 7;
-    int fy = sub.y & 7;
-
-    uint y0 = clamp(y,     0u, pc.frame_height - 1u) * pc.frame_width;
-    uint y1 = clamp(y + 1u, 0u, pc.frame_height - 1u) * pc.frame_width;
-    uint x0 = clamp(x,     0u, pc.frame_width - 1u);
-    uint x1 = clamp(x + 1u, 0u, pc.frame_width - 1u);
-
-    uint p00 = uint(ref_luma[y0 + x0]);
-    uint p10 = uint(ref_luma[y0 + x1]);
-    uint p01 = uint(ref_luma[y1 + x0]);
-    uint p11 = uint(ref_luma[y1 + x1]);
-
-    uint top = (p00 * (8u - uint(fx)) + p10 * uint(fx) + 4u) >> 3;
-    uint bot = (p01 * (8u - uint(fx)) + p11 * uint(fx) + 4u) >> 3;
-    return     (top * (8u - uint(fy)) + bot * uint(fy) + 4u) >> 3;
-}
 
 void main()
 {
@@ -70,12 +46,17 @@ void main()
     ivec2 mv_val = mv[by * blocks_per_row + bx];
 
     /* Reference position in 1/8 pixel units */
-    int ref_x8 = int(pixel.x) * 8 + mv_val.x;
-    int ref_y8 = int(pixel.y) * 8 + mv_val.y;
-    uint ref_x  = uint(ref_x8 >> 3);
-    uint ref_y  = uint(ref_y8 >> 3);
-    ivec2 sub   = ivec2(ref_x8 & 7, ref_y8 & 7);
+    float ref_x = float(int(pixel.x * 8) + mv_val.x) / 8.0;
+    float ref_y = float(int(pixel.y * 8) + mv_val.y) / 8.0;
 
-    uint predicted = bilinear(ref_x, ref_y, sub);
+    /* Normalize coordinates for sampler2D */
+    vec2 uv = vec2(ref_x + 0.5, ref_y + 0.5) / vec2(pc.frame_width, pc.frame_height);
+
+    /* Hardware bilinear interpolation */
+    float sampled = texture(ref_frame, uv).r;
+    
+    /* Convert back to 8-bit [0, 255] */
+    uint predicted = uint(clamp(sampled * 255.0, 0.0, 255.0));
+    
     dst_luma[pixel.y * pc.frame_width + pixel.x] = uint8_t(predicted);
 }

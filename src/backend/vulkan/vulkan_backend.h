@@ -17,6 +17,23 @@
 #include <vulkan/vulkan.h>
 
 typedef struct {
+    uint32_t is_intra;
+    uint32_t skip;
+    uint32_t block_size;
+    uint32_t tx_size;
+    
+    uint32_t pred_mode;
+    int32_t  qstep;
+    uint32_t coeff_offset;
+    uint32_t dst_stride;
+    
+    uint32_t dst_offset;
+    uint32_t pad1;
+    uint32_t pad2;
+    uint32_t pad3;
+} gpu_block_data_t;
+
+typedef struct {
     VkInstance       instance;
     VkPhysicalDevice phys_device;
     VkDevice         device;
@@ -30,16 +47,18 @@ typedef struct {
     VkPipeline       pipe_loopfilter;
     VkPipelineLayout pipe_layout;
     VkDescriptorPool desc_pool;
-    VkDescriptorSetLayout desc_layout;
+    VkDescriptorSetLayout desc_layout_mc;
+    VkDescriptorSetLayout desc_layout_buffer;
     VkDescriptorSet  desc_mc;
     VkDescriptorSet  desc_intra;
     VkDescriptorSet  desc_idct;
     VkDescriptorSet  desc_lf;
 
     /* Frame buffers (YUV format) */
-    VkBuffer         ref_bufs[8];
-    VkDeviceMemory   ref_mems[8];
-    size_t           ref_sizes[8];
+    VkImage          ref_images[8];
+    VkDeviceMemory   ref_image_mems[8];
+    VkImageView      ref_views[8];
+    VkSampler        ref_sampler;
     
     VkBuffer         dst_buf;
     VkDeviceMemory   dst_mem;
@@ -56,6 +75,11 @@ typedef struct {
     VkDeviceMemory   above_mem;
     VkBuffer         left_buf;
     VkDeviceMemory   left_mem;
+    
+    /* Batch block data buffer */
+    VkBuffer         block_buf;
+    VkDeviceMemory   block_mem;
+    size_t           block_buf_size;
 
     /* Current frame dimensions */
     uint32_t         width;

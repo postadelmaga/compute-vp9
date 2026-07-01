@@ -18,13 +18,26 @@ layout(set = 0, binding = 1, std430) buffer DstFrame {
     uint8_t dst_pixels[];
 };
 
-layout(push_constant) uniform PushConst {
-    uint block_size;   /* 4, 8, 16 or 32 */
-    int  qstep;        /* dequantization step */
-    uint block_offset; /* offset into coeff buffer */
+struct BlockData {
+    uint is_intra;
+    uint skip;
+    uint block_size;
+    uint tx_size;
+    
+    uint pred_mode;
+    int qstep;
+    uint coeff_offset;
     uint dst_stride;
-    uint dst_offset;   /* byte offset of block start in dst_pixels */
-} pc;
+    
+    uint dst_offset;
+    uint pad1;
+    uint pad2;
+    uint pad3;
+};
+
+layout(set = 0, binding = 2, std430) readonly buffer BlockBuf {
+    BlockData blocks[];
+};
 
 #define M_PI 3.141592653589793
 
@@ -61,8 +74,13 @@ shared float shared_Y[32][32];
 
 void main()
 {
+    uint block_idx = gl_WorkGroupID.x;
+    BlockData b = blocks[block_idx];
+    
+    if (b.skip != 0) return;
+    
     uint tid = gl_LocalInvocationID.x;
-    uint N = pc.block_size;
+    uint N = b.tx_size;
 
     // 1. Compute and store transform matrix M in shared memory
     if (tid < N) {
@@ -74,8 +92,8 @@ void main()
     // 2. Load and dequantize input coefficients in coalesced manner
     if (tid < N) {
         for (uint row = 0; row < N; row++) {
-            int coeff_val = int(coeff[pc.block_offset + row * N + tid]);
-            shared_in[row][tid] = float(coeff_val) * float(pc.qstep);
+            int coeff_val = int(coeff[b.coeff_offset + row * N + tid]);
+            shared_in[row][tid] = float(coeff_val) * float(b.qstep);
         }
     }
 
@@ -95,15 +113,16 @@ void main()
     barrier();
 
     // 4. Compute Out = Y * M and add to dst_pixels
+    // Transposed loop: tid is the column, row is the row. This ensures perfectly coalesced writes.
     if (tid < N) {
-        for (uint col = 0; col < N; col++) {
+        for (uint row = 0; row < N; row++) {
             float sum = 0.0;
             for (uint k = 0; k < N; k++) {
-                sum += shared_Y[tid][k] * shared_M[k][col];
+                sum += shared_Y[row][k] * shared_M[k][tid]; // Y * M
             }
             
             int rounded = int(round(sum));
-            uint pixel_offset = pc.dst_offset + tid * pc.dst_stride + col;
+            uint pixel_offset = b.dst_offset + row * b.dst_stride + tid;
             int pred_val = int(dst_pixels[pixel_offset]);
             
             dst_pixels[pixel_offset] = uint8_t(clamp(pred_val + rounded, 0, 255));

@@ -68,6 +68,65 @@ static uint32_t find_memory_type(VkPhysicalDevice phys, uint32_t type_filter, Vk
     return (uint32_t)-1;
 }
 
+
+static VkResult create_image(VkDevice device, VkPhysicalDevice phys, uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage *image, VkDeviceMemory *imageMemory) {
+    VkImageCreateInfo imageInfo = {0};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = width;
+    imageInfo.extent.height = height;
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = format;
+    imageInfo.tiling = tiling;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = usage;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateImage(device, &imageInfo, NULL, image) != VK_SUCCESS) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+    VkMemoryRequirements memRequirements;
+    vkGetImageMemoryRequirements(device, *image, &memRequirements);
+
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(phys, &memProperties);
+    uint32_t memoryTypeIndex = (uint32_t)-1;
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((memRequirements.memoryTypeBits & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            memoryTypeIndex = i;
+            break;
+        }
+    }
+
+    VkMemoryAllocateInfo allocInfo = {0};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = memoryTypeIndex;
+
+    if (vkAllocateMemory(device, &allocInfo, NULL, imageMemory) != VK_SUCCESS) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    vkBindImageMemory(device, *image, *imageMemory, 0);
+    return VK_SUCCESS;
+}
+
+static VkImageView create_image_view(VkDevice device, VkImage image, VkFormat format) {
+    VkImageViewCreateInfo viewInfo = {0};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+
+    VkImageView imageView;
+    if (vkCreateImageView(device, &viewInfo, NULL, &imageView) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return imageView;
+}
+
 static VkResult create_buffer(VkDevice device, VkPhysicalDevice phys, VkDeviceSize size,
                              VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
                              VkBuffer *buffer, VkDeviceMemory *memory)
@@ -117,6 +176,25 @@ static VkResult create_buffer(VkDevice device, VkPhysicalDevice phys, VkDeviceSi
 }
 
 /* Helper: allocate a descriptor set */
+static void bind_image_to_descriptor(VkDevice device, VkDescriptorSet set, uint32_t binding, VkImageView view, VkSampler sampler)
+{
+    VkDescriptorImageInfo image_info = {
+        .sampler = sampler,
+        .imageView = view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    };
+    VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = set,
+        .dstBinding = binding,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &image_info
+    };
+    vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
+}
+
 static VkDescriptorSet allocate_desc_set(VkDevice device, VkDescriptorPool pool, VkDescriptorSetLayout layout)
 {
     VkDescriptorSetAllocateInfo alloc_info = {
@@ -165,12 +243,18 @@ static VkResult ensure_buffers(vulkan_ctx_t *vk, uint32_t width, uint32_t height
         vk->dst_buf = VK_NULL_HANDLE;
     }
     for (int i = 0; i < 8; i++) {
-        if (vk->ref_bufs[i] != VK_NULL_HANDLE) {
-            vkDestroyBuffer(vk->device, vk->ref_bufs[i], NULL);
-            vkFreeMemory(vk->device, vk->ref_mems[i], NULL);
-            vk->ref_bufs[i] = VK_NULL_HANDLE;
+        if (vk->ref_images[i] != VK_NULL_HANDLE) {
+            vkDestroyImageView(vk->device, vk->ref_views[i], NULL);
+            vkDestroyImage(vk->device, vk->ref_images[i], NULL);
+            vkFreeMemory(vk->device, vk->ref_image_mems[i], NULL);
+            vk->ref_images[i] = VK_NULL_HANDLE;
         }
     }
+    if (vk->ref_sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(vk->device, vk->ref_sampler, NULL);
+        vk->ref_sampler = VK_NULL_HANDLE;
+    }
+    
     if (vk->above_buf != VK_NULL_HANDLE) {
         vkDestroyBuffer(vk->device, vk->above_buf, NULL);
         vkFreeMemory(vk->device, vk->above_mem, NULL);
@@ -198,15 +282,31 @@ static VkResult ensure_buffers(vulkan_ctx_t *vk, uint32_t width, uint32_t height
     }
                   
     for (int i = 0; i < 8; i++) {
-        vk->ref_sizes[i] = yuv_size;
-        res = create_buffer(vk->device, vk->phys_device, yuv_size,
-                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                      &vk->ref_bufs[i], &vk->ref_mems[i]);
+        res = create_image(vk->device, vk->phys_device, vk->width, vk->height, VK_FORMAT_R8_UNORM, VK_IMAGE_TILING_OPTIMAL,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                           &vk->ref_images[i], &vk->ref_image_mems[i]);
         if (res != VK_SUCCESS) {
-            fprintf(stderr, "[compute-vp9] Failed to create ref_buf[%d]: %d\n", i, res);
-            return res;
+            fprintf(stderr, "Failed to create ref image %d: %d\n", i, res);
+            return CVP9_ERR_GPU;
         }
+        vk->ref_views[i] = create_image_view(vk->device, vk->ref_images[i], VK_FORMAT_R8_UNORM);
+    }
+    VkSamplerCreateInfo samplerInfo = {0};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    VkResult samplerRes = vkCreateSampler(vk->device, &samplerInfo, NULL, &vk->ref_sampler);
+    if (samplerRes != VK_SUCCESS) {
+        fprintf(stderr, "Failed to create sampler: %d\n", samplerRes);
+        return CVP9_ERR_GPU;
     }
 
     res = create_buffer(vk->device, vk->phys_device, 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -373,8 +473,38 @@ cvp9_err_t vulkan_backend_init(void **ctx)
 
     vkGetDeviceQueue(vk->device, vk->compute_family, 0, &vk->compute_queue);
 
-    /* Setup Descriptor Layout */
-    VkDescriptorSetLayoutBinding bindings[3] = {
+    /* Descriptor Set Layout for MC (binding 0 is Image) */
+    VkDescriptorSetLayoutBinding bindings_mc[3] = {
+        {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
+        },
+        {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
+        },
+        {
+            .binding = 2,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
+        }
+    };
+    
+    VkDescriptorSetLayoutCreateInfo layout_info_mc = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 3,
+        .pBindings = bindings_mc
+    };
+    
+    vkCreateDescriptorSetLayout(vk->device, &layout_info_mc, NULL, &vk->desc_layout_mc);
+
+    /* Descriptor Set Layout for others (binding 0 is Buffer) */
+    VkDescriptorSetLayoutBinding bindings_buf[3] = {
         {
             .binding = 0,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -395,13 +525,13 @@ cvp9_err_t vulkan_backend_init(void **ctx)
         }
     };
     
-    VkDescriptorSetLayoutCreateInfo layout_info = {
+    VkDescriptorSetLayoutCreateInfo layout_info_buf = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount = 3,
-        .pBindings = bindings
+        .pBindings = bindings_buf
     };
     
-    vkCreateDescriptorSetLayout(vk->device, &layout_info, NULL, &vk->desc_layout);
+    vkCreateDescriptorSetLayout(vk->device, &layout_info_buf, NULL, &vk->desc_layout_buffer);
 
     /* Setup Pipeline Layout */
     VkPushConstantRange push_constant_range = {
@@ -410,15 +540,27 @@ cvp9_err_t vulkan_backend_init(void **ctx)
         .size = 32
     };
 
-    VkPipelineLayoutCreateInfo pipeline_layout_info = {
+    /* Setup Pipeline Layout for MC */
+    VkPipelineLayoutCreateInfo pipeline_layout_info_mc = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1,
-        .pSetLayouts = &vk->desc_layout,
+        .pSetLayouts = &vk->desc_layout_mc,
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push_constant_range
     };
+    
+    VkPipelineLayout pipe_layout_mc;
+    vkCreatePipelineLayout(vk->device, &pipeline_layout_info_mc, NULL, &pipe_layout_mc);
 
-    vkCreatePipelineLayout(vk->device, &pipeline_layout_info, NULL, &vk->pipe_layout);
+    /* Setup Pipeline Layout for Buffers (Intra, IDCT, LF) */
+    VkPipelineLayoutCreateInfo pipeline_layout_info_buf = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &vk->desc_layout_buffer,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_constant_range
+    };
+    vkCreatePipelineLayout(vk->device, &pipeline_layout_info_buf, NULL, &vk->pipe_layout);
 
     /* Create Compute Pipelines */
     VkShaderModule mod_idct = load_shader_module(vk->device, "vp9_idct.comp.glsl.spv");
@@ -433,7 +575,8 @@ cvp9_err_t vulkan_backend_init(void **ctx)
         if (mod_intra) vkDestroyShaderModule(vk->device, mod_intra, NULL);
         if (mod_loopfilter) vkDestroyShaderModule(vk->device, mod_loopfilter, NULL);
         vkDestroyPipelineLayout(vk->device, vk->pipe_layout, NULL);
-        vkDestroyDescriptorSetLayout(vk->device, vk->desc_layout, NULL);
+        vkDestroyDescriptorSetLayout(vk->device, vk->desc_layout_mc, NULL);
+        vkDestroyDescriptorSetLayout(vk->device, vk->desc_layout_buffer, NULL);
         vkDestroyDevice(vk->device, NULL);
         vkDestroyInstance(vk->instance, NULL);
         free(vk);
@@ -454,10 +597,12 @@ cvp9_err_t vulkan_backend_init(void **ctx)
     res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_idct);
     if (res != VK_SUCCESS) fprintf(stderr, "[compute-vp9] Failed to create pipe_idct: %d\n", res);
  
+    pipeline_create_info.layout = pipe_layout_mc;
     pipeline_create_info.stage.module = mod_mc;
     res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_mc);
     if (res != VK_SUCCESS) fprintf(stderr, "[compute-vp9] Failed to create pipe_mc: %d\n", res);
  
+    pipeline_create_info.layout = vk->pipe_layout;
     pipeline_create_info.stage.module = mod_intra;
     res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_intra);
     if (res != VK_SUCCESS) fprintf(stderr, "[compute-vp9] Failed to create pipe_intra: %d\n", res);
@@ -472,25 +617,25 @@ cvp9_err_t vulkan_backend_init(void **ctx)
     vkDestroyShaderModule(vk->device, mod_loopfilter, NULL);
 
     /* Descriptor Pool */
-    VkDescriptorPoolSize pool_size = {
-        .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 64
+    VkDescriptorPoolSize pool_size[2] = {
+        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 64 },
+        { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 32 }
     };
 
     VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 32,
-        .poolSizeCount = 1,
-        .pPoolSizes = &pool_size
+        .poolSizeCount = 2,
+        .pPoolSizes = pool_size
     };
 
     vkCreateDescriptorPool(vk->device, &pool_info, NULL, &vk->desc_pool);
 
     /* Allocate persistent descriptor sets */
-    vk->desc_mc = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
-    vk->desc_intra = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
-    vk->desc_idct = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
-    vk->desc_lf = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
+    vk->desc_mc = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_mc);
+    vk->desc_intra = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
+    vk->desc_idct = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
+    vk->desc_lf = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
 
     if (vk->desc_mc == VK_NULL_HANDLE || vk->desc_intra == VK_NULL_HANDLE ||
         vk->desc_idct == VK_NULL_HANDLE || vk->desc_lf == VK_NULL_HANDLE) {
@@ -533,8 +678,11 @@ void vulkan_backend_destroy(void *ctx)
         vkDestroyPipeline(vk->device, vk->pipe_loopfilter, NULL);
         vkDestroyPipelineLayout(vk->device, vk->pipe_layout, NULL);
         
-        if (vk->desc_layout != VK_NULL_HANDLE) {
-            vkDestroyDescriptorSetLayout(vk->device, vk->desc_layout, NULL);
+        if (vk->desc_layout_mc != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(vk->device, vk->desc_layout_mc, NULL);
+        }
+        if (vk->desc_layout_buffer != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(vk->device, vk->desc_layout_buffer, NULL);
         }
 
         if (vk->output_mapped) {
@@ -561,12 +709,20 @@ void vulkan_backend_destroy(void *ctx)
             vkDestroyBuffer(vk->device, vk->mv_buf, NULL);
             vkFreeMemory(vk->device, vk->mv_mem, NULL);
         }
+        if (vk->block_buf != VK_NULL_HANDLE) {
+            vkDestroyBuffer(vk->device, vk->block_buf, NULL);
+            vkFreeMemory(vk->device, vk->block_mem, NULL);
+        }
 
         for (int i = 0; i < 8; i++) {
-            if (vk->ref_bufs[i] != VK_NULL_HANDLE) {
-                vkDestroyBuffer(vk->device, vk->ref_bufs[i], NULL);
-                vkFreeMemory(vk->device, vk->ref_mems[i], NULL);
+            if (vk->ref_images[i] != VK_NULL_HANDLE) {
+                vkDestroyImageView(vk->device, vk->ref_views[i], NULL);
+                vkDestroyImage(vk->device, vk->ref_images[i], NULL);
+                vkFreeMemory(vk->device, vk->ref_image_mems[i], NULL);
             }
+        }
+        if (vk->ref_sampler != VK_NULL_HANDLE) {
+            vkDestroySampler(vk->device, vk->ref_sampler, NULL);
         }
         if (vk->dst_buf != VK_NULL_HANDLE) {
             vkDestroyBuffer(vk->device, vk->dst_buf, NULL);
@@ -606,6 +762,10 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
 
     vk->pts = pts;
     vk->has_frame = 1;
+    
+    if (pts == 1) {
+        printf("[compute-vp9] Frame %ld: num_blocks = %u\n", (long)pts, pf->num_blocks);
+    }
 
     /* Upload coefficients */
     size_t coeff_size = pf->num_coeffs * sizeof(int16_t);
@@ -643,18 +803,53 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
         vkUnmapMemory(vk->device, vk->mv_mem);
     }
 
+    /* Batch Command Submission: Upload block data */
+    size_t block_buf_size = pf->num_blocks * sizeof(gpu_block_data_t);
+    if (block_buf_size == 0) block_buf_size = sizeof(gpu_block_data_t);
+    if (vk->block_buf_size < block_buf_size) {
+        if (vk->block_buf != VK_NULL_HANDLE) {
+            vkDestroyBuffer(vk->device, vk->block_buf, NULL);
+            vkFreeMemory(vk->device, vk->block_mem, NULL);
+        }
+        create_buffer(vk->device, vk->phys_device, block_buf_size,
+                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      &vk->block_buf, &vk->block_mem);
+        vk->block_buf_size = block_buf_size;
+    }
+    if (pf->num_blocks > 0) {
+        gpu_block_data_t *mapped;
+        vkMapMemory(vk->device, vk->block_mem, 0, block_buf_size, 0, (void **)&mapped);
+        for (uint32_t i = 0; i < pf->num_blocks; i++) {
+            const vp9_macroblock_info_t *block = &pf->blocks[i];
+            mapped[i].is_intra = block->is_intra;
+            mapped[i].skip = block->skip;
+            mapped[i].block_size = block->width;
+            mapped[i].tx_size = 1 << (block->tx_size + 2);
+            mapped[i].pred_mode = block->y_mode;
+            mapped[i].qstep = 128; /* constant for now */
+            mapped[i].coeff_offset = block->coeff_offset;
+            mapped[i].dst_stride = vk->width;
+            mapped[i].dst_offset = block->y * vk->width + block->x;
+            mapped[i].pad1 = 0;
+            mapped[i].pad2 = 0;
+            mapped[i].pad3 = 0;
+        }
+        vkUnmapMemory(vk->device, vk->block_mem);
+    }
+
     /* Update descriptor sets once per frame */
-    bind_buffer_to_descriptor(vk->device, vk->desc_mc, 0, vk->ref_bufs[0], vk->dst_size);
+    bind_image_to_descriptor(vk->device, vk->desc_mc, 0, vk->ref_views[0], vk->ref_sampler);
     bind_buffer_to_descriptor(vk->device, vk->desc_mc, 1, vk->dst_buf, vk->dst_size);
     bind_buffer_to_descriptor(vk->device, vk->desc_mc, 2, vk->mv_buf, mv_size);
 
     bind_buffer_to_descriptor(vk->device, vk->desc_intra, 0, vk->dst_buf, vk->dst_size);
     bind_buffer_to_descriptor(vk->device, vk->desc_intra, 1, vk->dst_buf, vk->dst_size);
-    bind_buffer_to_descriptor(vk->device, vk->desc_intra, 2, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, vk->desc_intra, 2, vk->block_buf, block_buf_size);
 
     bind_buffer_to_descriptor(vk->device, vk->desc_idct, 0, vk->coeff_buf, coeff_size);
     bind_buffer_to_descriptor(vk->device, vk->desc_idct, 1, vk->dst_buf, vk->dst_size);
-    bind_buffer_to_descriptor(vk->device, vk->desc_idct, 2, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, vk->desc_idct, 2, vk->block_buf, block_buf_size);
 
     bind_buffer_to_descriptor(vk->device, vk->desc_lf, 0, vk->dst_buf, vk->dst_size);
     bind_buffer_to_descriptor(vk->device, vk->desc_lf, 1, vk->dst_buf, vk->dst_size);
@@ -703,73 +898,23 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &mem_barrier, 0, NULL, 0, NULL);
 
-    /* 2. Block-by-block Intra Prediction and IDCT Residual Addition */
-    int need_barrier_before_intra = 0;
-    for (uint32_t i = 0; i < pf->num_blocks; i++) {
-        const vp9_macroblock_info_t *block = &pf->blocks[i];
-        uint32_t block_size = block->width;
+    /* 2. Block-by-block Batched Submission (Intra then IDCT) */
+    if (pf->num_blocks > 0) {
+        /* Dispatch all Intra Prediction blocks */
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_intra);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_intra, 0, NULL);
+        vkCmdDispatch(cmd, pf->num_blocks, 1, 1);
 
-        if (block->is_intra) {
-            /* Synchronize if any IDCT ran since the last barrier, ensuring reconstructed neighbors are visible */
-            if (need_barrier_before_intra) {
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                     0, 1, &mem_barrier, 0, NULL, 0, NULL);
-                need_barrier_before_intra = 0;
-            }
+        /* Barrier to ensure Intra finishes before IDCT adds residual */
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &mem_barrier, 0, NULL, 0, NULL);
 
-            /* Dispatch Intra prediction */
-            struct {
-                uint32_t block_size;
-                uint32_t pred_mode;
-                uint32_t dst_stride;
-                uint32_t dst_offset;
-            } pc_intra = {
-                .block_size = block_size,
-                .pred_mode = block->y_mode,
-                .dst_stride = vk->width,
-                .dst_offset = block->y * vk->width + block->x
-            };
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_intra);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_intra, 0, NULL);
-            vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_intra), &pc_intra);
-            vkCmdDispatch(cmd, (block_size + 7) / 8, (block_size + 7) / 8, 1);
-            
-            /* Must synchronize intra pred write before IDCT reads it for the same block */
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 0, 1, &mem_barrier, 0, NULL, 0, NULL);
-        }
-
-        /* Residual Addition (IDCT) */
-        if (!block->skip) {
-            uint32_t tx_size = 1 << (block->tx_size + 2);
-
-            struct {
-                uint32_t block_size;
-                int      qstep;
-                uint32_t block_offset;
-                uint32_t dst_stride;
-                uint32_t dst_offset;
-            } pc_idct = {
-                .block_size = tx_size,
-                .qstep = 128, /* quantization scale step */
-                .block_offset = block->coeff_offset,
-                .dst_stride = vk->width,
-                .dst_offset = block->y * vk->width + block->x
-            };
-
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_idct);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_idct, 0, NULL);
-            vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_idct), &pc_idct);
-            vkCmdDispatch(cmd, 1, 1, 1);
-
-            /* Set flag to require barrier before any future intra block reads */
-            need_barrier_before_intra = 1;
-        }
-    }
-
-    /* Ensure all block reconstruction writes are completed before starting loop filtering */
-    if (need_barrier_before_intra) {
+        /* Dispatch all IDCT/Residual blocks */
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_idct);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_idct, 0, NULL);
+        vkCmdDispatch(cmd, pf->num_blocks, 1, 1);
+        
+        /* Barrier to ensure IDCT writes complete before Loop Filter */
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &mem_barrier, 0, NULL, 0, NULL);
     }
@@ -788,13 +933,12 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
         .stride = vk->width,
         .filter_level = 32,
         .sharpness = 0,
-        .pass = 0 /* Horizontal pass */
+        .pass = 0 
     };
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_loopfilter);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_lf, 0, NULL);
     
-    /* Horizontal pass */
     vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_lf), &pc_lf);
     vkCmdDispatch(cmd, (vk->width + 7) / 8, 1, 1);
 
@@ -827,12 +971,45 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     vkCmdCopyBuffer(cmd, vk->dst_buf, vk->output_buf, 1, &copy_region);
 
     /* Update Reference frame slot 0 for subsequent inter frames */
-    VkBufferCopy ref_copy = {
-        .srcOffset = 0,
-        .dstOffset = 0,
-        .size = vk->dst_size
-    };
-    vkCmdCopyBuffer(cmd, vk->dst_buf, vk->ref_bufs[0], 1, &ref_copy);
+    /* Transition ref_image to TRANSFER_DST */
+    VkImageMemoryBarrier barrier = {0};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = vk->ref_images[0];
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &barrier);
+
+    VkBufferImageCopy region = {0};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = (VkOffset3D){0, 0, 0};
+    region.imageExtent = (VkExtent3D){vk->width, vk->height, 1};
+
+    vkCmdCopyBufferToImage(cmd, vk->dst_buf, vk->ref_images[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    /* Transition to SHADER_READ_ONLY */
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 0, NULL, 0, NULL, 1, &barrier);
 
     /* Pipeline barrier: transfer write -> host read */
     VkMemoryBarrier host_barrier = {
