@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04]
+        build_type: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build \
+            libva-dev libva-drm2 \
+            vulkan-tools libvulkan-dev glslang-tools \
+            spirv-tools \
+            clang clang-format clang-tidy
+
+      - name: Configure (Vulkan + VA-API)
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DENABLE_VULKAN=ON \
+            -DENABLE_VAAPI=ON \
+            -DENABLE_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Check formatting
+        run: |
+          find src include tests -name '*.c' -o -name '*.h' | \
+            xargs clang-format --dry-run --Werror
+
+  shader-validation:
+    name: Validate SPIR-V shaders
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools spirv-tools
+
+      - name: Compile shaders
+        run: |
+          mkdir -p build/shaders
+          for f in shaders/*.glsl; do
+            glslangValidator -V --target-env vulkan1.1 \
+              -S comp "$f" \
+              -o "build/shaders/$(basename $f).spv"
+            echo "✓ $f"
+          done
+
+      - name: Validate SPIR-V
+        run: |
+          for spv in build/shaders/*.spv; do
+            spirv-val "$spv" && echo "✓ $spv"
+          done
