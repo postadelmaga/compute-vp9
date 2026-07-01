@@ -3,6 +3,7 @@
 #include <assert.h>
 #include "compute_vp9/decoder.h"
 #include "../src/decoder/vp9_bitstream.h"
+#include "../src/decoder/vpx_reader.h"
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 #define PASS(name) printf("  ✓ %s\n", name)
@@ -31,6 +32,26 @@ int test_bitstream(void)
     if (vp9_read_bits(&br, 4) != 0b0000) FAIL("upper nibble", "wrong");
     if (vp9_read_bits(&br, 4) != 0b1111) FAIL("lower nibble", "wrong");
     PASS("second byte");
+
+    return 0;
+}
+
+/* ── Test: range coder (vpx_reader) ──────────────────────────────────────── */
+int test_range_coder(void)
+{
+    printf("=== test_range_coder ===\n");
+
+    // An all-zero byte array should start with a 0 marker bit (so init returns 0)
+    uint8_t zero_data[8] = { 0 };
+    vpx_reader r;
+    int err = vpx_reader_init(&r, zero_data, sizeof(zero_data));
+    if (err != 0) FAIL("vpx_reader_init", "expected 0 (marker bit is 0)");
+
+    // Read a few bits with 50/50 probability
+    int b0 = vpx_read_bit(&r);
+    int b1 = vpx_read_bit(&r);
+    printf("  read bits: %d, %d\n", b0, b1);
+    PASS("read bits from range coder");
 
     return 0;
 }
@@ -104,6 +125,8 @@ int main(int argc, char **argv)
     int failures = 0;
     if (strcmp(test, "bitstream")    == 0 || strcmp(test, "all") == 0)
         failures += test_bitstream();
+    if (strcmp(test, "range_coder")   == 0 || strcmp(test, "all") == 0)
+        failures += test_range_coder();
     if (strcmp(test, "frame_header") == 0 || strcmp(test, "all") == 0)
         failures += test_frame_header();
     if (strcmp(test, "backend")      == 0 || strcmp(test, "all") == 0)

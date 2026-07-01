@@ -14,6 +14,7 @@ target_include_directories(test_decoder PRIVATE
 
 # ── Test cases ───────────────────────────────────────────────────────────────
 add_test(NAME test_bitstream_reader  COMMAND test_decoder --test bitstream)
+add_test(NAME test_range_coder       COMMAND test_decoder --test range_coder)
 add_test(NAME test_frame_header      COMMAND test_decoder --test frame_header)
 add_test(NAME test_backend_init      COMMAND test_decoder --test backend)
 add_test(NAME test_decode_key_frame  COMMAND test_decoder --test keyframe
