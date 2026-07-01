@@ -47,12 +47,14 @@ add_library(compute_vp9 SHARED
     src/decoder/vp9_entropy.c
     src/decoder/vp9_tile.c
     src/decoder/vp9_frame.c
+    src/decoder/vp9_parsed_frame.c
+    src/decoder/vp9_reconstruct.c
 )
 
 target_include_directories(compute_vp9
-    PUBLIC  include
-    PRIVATE src
+    PUBLIC  include src
 )
+target_link_libraries(compute_vp9 PRIVATE m)
 
 # ─── Shader compilation (after target exists) ────────────────────────────────
 if(ENABLE_VULKAN AND GLSLC)
@@ -92,7 +94,7 @@ if(ENABLE_VAAPI)
     )
     target_include_directories(compute_vp9 PRIVATE ${LIBVA_INCLUDE_DIRS})
     target_link_libraries(compute_vp9 PRIVATE ${LIBVA_LIBRARIES} ${LIBVA_DRM_LIBRARIES})
-    target_compile_definitions(compute_vp9 PRIVATE ENABLE_VAAPI)
+    target_compile_definitions(compute_vp9 PUBLIC ENABLE_VAAPI)
 endif()
 
 set_target_properties(compute_vp9 PROPERTIES

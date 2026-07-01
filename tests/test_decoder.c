@@ -4,6 +4,9 @@
 #include "compute_vp9/decoder.h"
 #include "../src/decoder/vp9_bitstream.h"
 #include "../src/decoder/vpx_reader.h"
+#include "../src/decoder/vp9_parsed_frame.h"
+#include "../src/decoder/vp9_entropy.h"
+#include "../src/decoder/vp9_tile.h"
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
 #define PASS(name) printf("  ✓ %s\n", name)
@@ -115,6 +118,86 @@ int test_backend(void)
     return 0;
 }
 
+/* ── Test: tile and block parsing ────────────────────────────────────────── */
+int test_tile_parsing(void)
+{
+    printf("=== test_tile_parsing ===\n");
+
+    vp9_frame_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.width = 128;
+    hdr.height = 128;
+    hdr.frame_type = VP9_FRAME_KEY;
+    hdr.log2_tile_cols = 0;
+    hdr.log2_tile_rows = 0;
+
+    uint8_t dummy_tile_data[256] = {0};
+
+    vp9_parsed_frame_t *pf = vp9_parsed_frame_alloc(hdr.width, hdr.height);
+    if (!pf) FAIL("vp9_parsed_frame_alloc", "returned NULL");
+
+    vp9_entropy_probs_t probs;
+    vp9_entropy_probs_init(&probs);
+
+    int rc = vp9_decode_tiles(&hdr, dummy_tile_data, sizeof(dummy_tile_data), &probs, pf);
+    printf("  vp9_decode_tiles returned %d, parsed %u blocks, %u coeffs\n",
+           rc, pf->num_blocks, pf->num_coeffs);
+
+    if (rc != 0) FAIL("vp9_decode_tiles", "decoding failed");
+    if (pf->num_blocks == 0) FAIL("num_blocks", "no blocks parsed");
+
+    vp9_parsed_frame_free(pf);
+    PASS("tile and block parsing completed successfully");
+    return 0;
+}
+
+/* ── Test: end-to-end keyframe decoding ──────────────────────────────────── */
+int test_keyframe_decode(void)
+{
+    printf("=== test_keyframe_decode ===\n");
+
+    /* Construct a minimal valid VP9 keyframe package */
+    uint8_t packet[] = {
+        0x82,               /* marker, profile, keyframe, show_frame, etc. */
+        0x49, 0x83, 0x42,  /* sync code */
+        0x00, 0x0F, 0xE0, 0x0F, 0xF0, 0x00, 0x00, 0x00, /* width, height, qindex, delta q, filter, tiles */
+        
+        /* Compressed header size (16-bit) = 4 */
+        0x00, 0x04,
+        /* Compressed header (4 bytes) */
+        0x00, 0x00, 0x00, 0x00,
+        
+        /* Tile data (zeros) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+
+    cvp9_ctx_t *ctx = NULL;
+    cvp9_config_t cfg = { .backend = CVP9_BACKEND_CPU };
+    cvp9_err_t err = cvp9_create(&cfg, &ctx);
+    if (err != CVP9_OK) FAIL("cvp9_create", cvp9_err_str(err));
+
+    err = cvp9_decode(ctx, packet, sizeof(packet), 12345);
+    if (err != CVP9_OK) FAIL("cvp9_decode", cvp9_err_str(err));
+
+    cvp9_frame_info_t frame;
+    err = cvp9_get_frame(ctx, &frame);
+    if (err != CVP9_OK) FAIL("cvp9_get_frame", cvp9_err_str(err));
+
+    printf("  decoded frame width=%u, height=%u, pts=%ld\n",
+           frame.width, frame.height, frame.pts);
+
+    if (frame.width != 128) FAIL("frame.width", "wrong width");
+    if (frame.height != 128) FAIL("frame.height", "wrong height");
+    if (frame.pts != 12345) FAIL("frame.pts", "wrong pts");
+
+    cvp9_destroy(ctx);
+    PASS("full keyframe decode and YUV output verified");
+    return 0;
+}
+
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
@@ -131,6 +214,10 @@ int main(int argc, char **argv)
         failures += test_frame_header();
     if (strcmp(test, "backend")      == 0 || strcmp(test, "all") == 0)
         failures += test_backend();
+    if (strcmp(test, "tile_parsing")  == 0 || strcmp(test, "all") == 0)
+        failures += test_tile_parsing();
+    if (strcmp(test, "keyframe")      == 0 || strcmp(test, "all") == 0)
+        failures += test_keyframe_decode();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED ✓" : "SOME TESTS FAILED ✗");
     return failures;

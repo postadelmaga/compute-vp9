@@ -24,12 +24,11 @@ void vulkan_backend_destroy(void *ctx)
 }
 
 cvp9_err_t vulkan_decode_frame(void *ctx,
-                                const vp9_frame_header_t *hdr,
-                                const uint8_t *data, size_t size,
+                                const vp9_parsed_frame_t *pf,
                                 int64_t pts)
 {
-    (void)ctx; (void)hdr; (void)data; (void)size; (void)pts;
-    return CVP9_OK;
+    (void)ctx; (void)pf; (void)pts;
+    return CVP9_ERR_UNSUPPORTED; /* Fallback to CPU reconstruction */
 }
 
 cvp9_err_t vulkan_get_frame(void *ctx, cvp9_frame_info_t *info)

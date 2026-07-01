@@ -45,9 +45,10 @@ typedef struct {
 cvp9_err_t vulkan_backend_init(void **ctx);
 void       vulkan_backend_destroy(void *ctx);
 
+#include "decoder/vp9_parsed_frame.h"
+
 cvp9_err_t vulkan_decode_frame(void *ctx,
-                                const vp9_frame_header_t *hdr,
-                                const uint8_t *data, size_t size,
+                                const vp9_parsed_frame_t *pf,
                                 int64_t pts);
 
 cvp9_err_t vulkan_get_frame(void *ctx, cvp9_frame_info_t *info);

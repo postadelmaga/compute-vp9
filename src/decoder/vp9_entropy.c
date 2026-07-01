@@ -1,8 +1,223 @@
 /**
- * compute-vp9 — VP9 entropy decoding stub
+ * compute-vp9 — VP9 entropy decoding implementation
  */
-#include "vp9_bitstream.h"
+#include "vp9_entropy.h"
+#include <stdlib.h>
+#include <string.h>
 
-// Stubs for entropy decoding logic (e.g. Bool coder, probability updates)
-// Will be implemented in subsequent phases.
-void vp9_entropy_stub_dummy(void) {}
+/* Scan tables allocated globally and generated dynamically on first use */
+uint16_t vp9_default_scan_4x4[16];
+uint16_t vp9_default_scan_8x8[64];
+uint16_t vp9_default_scan_16x16[256];
+uint16_t vp9_default_scan_32x32[1024];
+
+static bool scans_initialized = false;
+
+static void generate_zigzag_scan(uint16_t *scan, int size)
+{
+    int i = 0;
+    for (int sum = 0; sum < 2 * size - 1; sum++) {
+        if (sum % 2 == 1) { /* down-left */
+            for (int r = 0; r < size; r++) {
+                int c = sum - r;
+                if (c >= 0 && c < size) {
+                    scan[i++] = r * size + c;
+                }
+            }
+        } else { /* up-right */
+            for (int c = 0; c < size; c++) {
+                int r = sum - c;
+                if (r >= 0 && r < size) {
+                    scan[i++] = r * size + c;
+                }
+            }
+        }
+    }
+}
+
+static void init_scans(void)
+{
+    if (scans_initialized) return;
+    generate_zigzag_scan(vp9_default_scan_4x4, 4);
+    generate_zigzag_scan(vp9_default_scan_8x8, 8);
+    generate_zigzag_scan(vp9_default_scan_16x16, 16);
+    generate_zigzag_scan(vp9_default_scan_32x32, 32);
+    scans_initialized = true;
+}
+
+void vp9_entropy_probs_init(vp9_entropy_probs_t *probs)
+{
+    init_scans();
+    
+    /* Initialize all probabilities to neutral 50/50 (128) */
+    memset(probs->coef_probs, 128, sizeof(probs->coef_probs));
+    memset(probs->skip_probs, 128, sizeof(probs->skip_probs));
+    memset(probs->intra_inter_probs, 128, sizeof(probs->intra_inter_probs));
+    memset(probs->tx_probs, 128, sizeof(probs->tx_probs));
+    memset(probs->partition_probs, 128, sizeof(probs->partition_probs));
+}
+
+/* VP9 coefficient Huffman tree decisions */
+int vp9_read_coef_token(vpx_reader *r, const uint8_t probs[UNCONSTRAINED_NODES])
+{
+    /* Node 0: EOB vs others */
+    if (!vpx_read(r, probs[0]))
+        return EOB_TOKEN;
+
+    /* Node 1: ZERO vs others */
+    if (!vpx_read(r, probs[1]))
+        return ZERO_TOKEN;
+
+    /* Node 2: ONE vs others */
+    if (!vpx_read(r, probs[2]))
+        return ONE_TOKEN;
+
+    /* Tree structure for category selection */
+    /* Node 3: TWO vs others */
+    if (!vpx_read(r, 128)) /* unconstrained in standard contexts or custom prob */
+        return TWO_TOKEN;
+
+    /* Node 4: THREE vs others */
+    if (!vpx_read(r, 128))
+        return THREE_TOKEN;
+
+    /* Node 5: FOUR vs others */
+    if (!vpx_read(r, 128))
+        return FOUR_TOKEN;
+
+    /* Nodes for CAT1 to CAT6 */
+    if (!vpx_read(r, 128)) {
+        /* Node 6: CAT1 vs CAT2 */
+        if (!vpx_read(r, 128))
+            return DCT_VAL_CAT1;
+        else
+            return DCT_VAL_CAT2;
+    } else {
+        /* Node 7: CAT3/4 vs CAT5/6 */
+        if (!vpx_read(r, 128)) {
+            if (!vpx_read(r, 128))
+                return DCT_VAL_CAT3;
+            else
+                return DCT_VAL_CAT4;
+        } else {
+            if (!vpx_read(r, 128))
+                return DCT_VAL_CAT5;
+            else
+                return DCT_VAL_CAT6;
+        }
+    }
+}
+
+int32_t vp9_decode_coef_value(vpx_reader *r, int token, int bit_depth)
+{
+    if (token <= ZERO_TOKEN) return 0;
+    if (token == ONE_TOKEN)  return 1;
+    if (token == TWO_TOKEN)  return 2;
+    if (token == THREE_TOKEN) return 3;
+    if (token == FOUR_TOKEN)  return 4;
+
+    int32_t val = 0;
+    int extra_bits = 0;
+    int32_t base = 0;
+
+    switch (token) {
+    case DCT_VAL_CAT1:
+        base = 5;
+        extra_bits = 1;
+        break;
+    case DCT_VAL_CAT2:
+        base = 7;
+        extra_bits = 2;
+        break;
+    case DCT_VAL_CAT3:
+        base = 11;
+        extra_bits = 3;
+        break;
+    case DCT_VAL_CAT4:
+        base = 19;
+        extra_bits = 4;
+        break;
+    case DCT_VAL_CAT5:
+        base = 35;
+        extra_bits = 5;
+        break;
+    case DCT_VAL_CAT6:
+        base = 67;
+        extra_bits = 11 + (bit_depth - 8);
+        break;
+    default:
+        return 0;
+    }
+
+    /* Read extra bits from range coder */
+    int32_t extra = 0;
+    for (int i = 0; i < extra_bits; i++) {
+        extra = (extra << 1) | vpx_read_bit(r);
+    }
+    
+    val = base + extra;
+    return val;
+}
+
+int vp9_decode_tx_block(vpx_reader *r, int tx_size, int plane_type, int ref_type,
+                        const vp9_entropy_probs_t *probs, int neighbor_context,
+                        int16_t *out_coeffs)
+{
+    init_scans();
+
+    int max_coeffs = 1 << (2 * tx_size + 4); /* 16, 64, 256, 1024 */
+    const uint16_t *scan = NULL;
+
+    switch (tx_size) {
+    case 0: scan = vp9_default_scan_4x4; break;
+    case 1: scan = vp9_default_scan_8x8; break;
+    case 2: scan = vp9_default_scan_16x16; break;
+    case 3: scan = vp9_default_scan_32x32; break;
+    default: return 0;
+    }
+
+    memset(out_coeffs, 0, max_coeffs * sizeof(int16_t));
+
+    int eob = 0;
+    int prev_val = 0;
+
+    for (int i = 0; i < max_coeffs; i++) {
+        /* Determine context band */
+        int band;
+        if (i == 0)      band = 0;
+        else if (i == 1) band = 1;
+        else if (i < 6)  band = 2;
+        else if (i < 14) band = 3;
+        else if (i < 30) band = 4;
+        else             band = 5;
+
+        /* Derive coefficient context from previous parsed value (except for DC) */
+        int coef_ctx;
+        if (i == 0) {
+            coef_ctx = neighbor_context;
+        } else {
+            coef_ctx = (prev_val == 0) ? 0 : (prev_val == 1) ? 1 : 2;
+        }
+
+        const uint8_t *node_probs = probs->coef_probs[tx_size][plane_type][ref_type][band][coef_ctx];
+
+        int token = vp9_read_coef_token(r, node_probs);
+        if (token == EOB_TOKEN) {
+            eob = i;
+            break;
+        }
+
+        int32_t val = vp9_decode_coef_value(r, token, 8); /* Default to 8-bit depth */
+        prev_val = val;
+
+        if (val > 0) {
+            int sign = vpx_read_bit(r);
+            int16_t signed_val = (sign) ? -val : val;
+            out_coeffs[scan[i]] = signed_val;
+        }
+
+        eob = i + 1;
+    }
+
+    return eob;
+}
