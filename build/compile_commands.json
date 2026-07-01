@@ -1,0 +1,86 @@
+[
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/decoder/vp9_decoder.c.o -c /mnt/dati/Dev/compute-vp9/src/decoder/vp9_decoder.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/decoder/vp9_decoder.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/decoder/vp9_decoder.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/decoder/vp9_bitstream.c.o -c /mnt/dati/Dev/compute-vp9/src/decoder/vp9_bitstream.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/decoder/vp9_bitstream.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/decoder/vp9_bitstream.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/decoder/vp9_entropy.c.o -c /mnt/dati/Dev/compute-vp9/src/decoder/vp9_entropy.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/decoder/vp9_entropy.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/decoder/vp9_entropy.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/decoder/vp9_tile.c.o -c /mnt/dati/Dev/compute-vp9/src/decoder/vp9_tile.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/decoder/vp9_tile.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/decoder/vp9_tile.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/decoder/vp9_frame.c.o -c /mnt/dati/Dev/compute-vp9/src/decoder/vp9_frame.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/decoder/vp9_frame.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/decoder/vp9_frame.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/backend/vulkan/vulkan_backend.c.o -c /mnt/dati/Dev/compute-vp9/src/backend/vulkan/vulkan_backend.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/backend/vulkan/vulkan_backend.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/backend/vulkan/vulkan_backend.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/backend/vulkan/vulkan_utils.c.o -c /mnt/dati/Dev/compute-vp9/src/backend/vulkan/vulkan_utils.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/backend/vulkan/vulkan_utils.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/backend/vulkan/vulkan_utils.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/backend/vulkan/shader_registry.c.o -c /mnt/dati/Dev/compute-vp9/src/backend/vulkan/shader_registry.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/backend/vulkan/shader_registry.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/backend/vulkan/shader_registry.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/vaapi/vaapi_driver.c.o -c /mnt/dati/Dev/compute-vp9/src/vaapi/vaapi_driver.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/vaapi/vaapi_driver.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/vaapi/vaapi_driver.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/vaapi/vaapi_surface.c.o -c /mnt/dati/Dev/compute-vp9/src/vaapi/vaapi_surface.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/vaapi/vaapi_surface.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/vaapi/vaapi_surface.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -DENABLE_VAAPI -DENABLE_VULKAN -DSPIRV_OUTPUT_DIR=\\\"/mnt/dati/Dev/compute-vp9/build/shaders\\\" -Dcompute_vp9_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9.dir/src/vaapi/vaapi_config.c.o -c /mnt/dati/Dev/compute-vp9/src/vaapi/vaapi_config.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/vaapi/vaapi_config.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9.dir/src/vaapi/vaapi_config.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -Dcompute_vp9_drv_video_EXPORTS -I/mnt/dati/Dev/compute-vp9/include -g -std=gnu11 -fPIC -o CMakeFiles/compute_vp9_drv_video.dir/src/vaapi/vaapi_entrypoint.c.o -c /mnt/dati/Dev/compute-vp9/src/vaapi/vaapi_entrypoint.c",
+  "file": "/mnt/dati/Dev/compute-vp9/src/vaapi/vaapi_entrypoint.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/CMakeFiles/compute_vp9_drv_video.dir/src/vaapi/vaapi_entrypoint.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -o tests/CMakeFiles/test_decoder.dir/test_decoder.c.o -c /mnt/dati/Dev/compute-vp9/tests/test_decoder.c",
+  "file": "/mnt/dati/Dev/compute-vp9/tests/test_decoder.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/tests/CMakeFiles/test_decoder.dir/test_decoder.c.o"
+},
+{
+  "directory": "/mnt/dati/Dev/compute-vp9/build",
+  "command": "/usr/bin/cc -I/mnt/dati/Dev/compute-vp9/include -I/mnt/dati/Dev/compute-vp9/src -g -std=gnu11 -o tests/CMakeFiles/test_decoder.dir/test_bitstream.c.o -c /mnt/dati/Dev/compute-vp9/tests/test_bitstream.c",
+  "file": "/mnt/dati/Dev/compute-vp9/tests/test_bitstream.c",
+  "output": "/mnt/dati/Dev/compute-vp9/build/tests/CMakeFiles/test_decoder.dir/test_bitstream.c.o"
+}
+]

@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"/mnt/dati/Dev/compute-vp9/build/cmake_install.cmake",
+		"/mnt/dati/Dev/compute-vp9/build/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

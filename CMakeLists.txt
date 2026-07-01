@@ -39,17 +39,6 @@ if(ENABLE_OPENCL)
     find_package(OpenCL REQUIRED)
 endif()
 
-# ─── Shader compilation ─────────────────────────────────────────────────────
-if(ENABLE_VULKAN AND GLSLC)
-    include(cmake/CompileShaders.cmake)
-    compile_shaders(VP9_SHADERS
-        shaders/vp9_idct.comp.glsl
-        shaders/vp9_mc.comp.glsl
-        shaders/vp9_intra_pred.comp.glsl
-        shaders/vp9_loopfilter.comp.glsl
-    )
-endif()
-
 # ─── Library target ─────────────────────────────────────────────────────────
 add_library(compute_vp9 SHARED
     src/decoder/vp9_decoder.c
@@ -63,6 +52,18 @@ target_include_directories(compute_vp9
     PUBLIC  include
     PRIVATE src
 )
+
+# ─── Shader compilation (after target exists) ────────────────────────────────
+if(ENABLE_VULKAN AND GLSLC)
+    include(cmake/CompileShaders.cmake)
+    compile_shaders(VP9_SHADERS
+        shaders/vp9_idct.comp.glsl
+        shaders/vp9_mc.comp.glsl
+        shaders/vp9_intra_pred.comp.glsl
+        shaders/vp9_loopfilter.comp.glsl
+    )
+    add_dependencies(compute_vp9 VP9_SHADERS)
+endif()
 
 if(ENABLE_VULKAN)
     target_sources(compute_vp9 PRIVATE
