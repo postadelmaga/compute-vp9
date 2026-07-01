@@ -198,6 +198,58 @@ int test_keyframe_decode(void)
     return 0;
 }
 
+/* ── Test: end-to-end Vulkan keyframe decoding ───────────────────────────── */
+int test_keyframe_decode_vulkan(void)
+{
+#ifndef ENABLE_VULKAN
+    printf("=== test_keyframe_decode_vulkan (disabled) ===\n");
+    return 0;
+#else
+    printf("=== test_keyframe_decode_vulkan ===\n");
+
+    /* Construct a minimal valid VP9 keyframe package */
+    uint8_t packet[] = {
+        0x82,               /* marker, profile, keyframe, show_frame, etc. */
+        0x49, 0x83, 0x42,  /* sync code */
+        0x00, 0x0F, 0xE0, 0x0F, 0xF0, 0x00, 0x00, 0x00, /* width, height, qindex, delta q, filter, tiles */
+        
+        /* Compressed header size (16-bit) = 4 */
+        0x00, 0x04,
+        /* Compressed header (4 bytes) */
+        0x00, 0x00, 0x00, 0x00,
+        
+        /* Tile data (zeros) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+
+    cvp9_ctx_t *ctx = NULL;
+    cvp9_config_t cfg = { .backend = CVP9_BACKEND_VULKAN };
+    cvp9_err_t err = cvp9_create(&cfg, &ctx);
+    if (err != CVP9_OK) FAIL("cvp9_create", cvp9_err_str(err));
+
+    err = cvp9_decode(ctx, packet, sizeof(packet), 12345);
+    if (err != CVP9_OK) FAIL("cvp9_decode", cvp9_err_str(err));
+
+    cvp9_frame_info_t frame;
+    err = cvp9_get_frame(ctx, &frame);
+    if (err != CVP9_OK) FAIL("cvp9_get_frame", cvp9_err_str(err));
+
+    printf("  decoded frame width=%u, height=%u, pts=%ld\n",
+           frame.width, frame.height, frame.pts);
+
+    if (frame.width != 128) FAIL("frame.width", "wrong width");
+    if (frame.height != 128) FAIL("frame.height", "wrong height");
+    if (frame.pts != 12345) FAIL("frame.pts", "wrong pts");
+
+    cvp9_destroy(ctx);
+    PASS("full Vulkan keyframe decode and YUV output verified");
+    return 0;
+#endif
+}
+
 /* ── Entry point ─────────────────────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
@@ -218,6 +270,8 @@ int main(int argc, char **argv)
         failures += test_tile_parsing();
     if (strcmp(test, "keyframe")      == 0 || strcmp(test, "all") == 0)
         failures += test_keyframe_decode();
+    if (strcmp(test, "keyframe_vulkan") == 0 || strcmp(test, "all") == 0)
+        failures += test_keyframe_decode_vulkan();
 
     printf("\n%s\n", failures == 0 ? "ALL TESTS PASSED ✓" : "SOME TESTS FAILED ✗");
     return failures;

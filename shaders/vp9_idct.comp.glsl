@@ -1,16 +1,12 @@
 /**
- * VP9 Inverse DCT — Vulkan compute shader
+ * VP9 Inverse DCT and Residual Addition — Vulkan compute shader
  *
- * Implements 4x4, 8x8, 16x16 and 32x32 2D IDCT on transform coefficients.
- * Each workgroup processes one transform block.
- *
- * Binding layout:
- *   binding=0  — input:  int16 coefficients  (readonly)
- *   binding=1  — output: int16 residuals      (writeonly)
- *   push constants: block_size (4/8/16/32), qstep
+ * Performs 2D IDCT and adds the residuals directly to the prediction frame.
  */
 #version 450
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
@@ -18,61 +14,69 @@ layout(set = 0, binding = 0, std430) readonly buffer CoeffIn {
     int16_t coeff[];
 };
 
-layout(set = 0, binding = 1, std430) writeonly buffer ResidualOut {
-    int16_t residual[];
+layout(set = 0, binding = 1, std430) buffer DstFrame {
+    uint8_t dst_pixels[];
 };
 
 layout(push_constant) uniform PushConst {
     uint block_size;   /* 4, 8, 16 or 32 */
     int  qstep;        /* dequantization step */
-    uint block_offset; /* offset into coeff/residual buffers */
+    uint block_offset; /* offset into coeff buffer */
+    uint dst_stride;
+    uint dst_offset;   /* byte offset of block start in dst_pixels */
 } pc;
 
-/* ── Shared memory for 1D butterfly passes ──────────────────────────────── */
-shared int tmp[32];
+#define M_PI 3.141592653589793
 
-/* ── VP9 IDCT constants (scaled by 2^14) ────────────────────────────────── */
-const int COS_PI_1_64 = 16364;
-const int COS_PI_4_64 = 15137;
-const int COS_PI_8_64 = 13623;
-const int COS_PI_16_64 = 11585;
-
-int butterfly(int a, int b, int cos_val, int sin_val) {
-    return (a * cos_val + b * sin_val + (1 << 13)) >> 14;
+float get_matrix_val(uint i, uint j, uint size) {
+    if (i == 0) {
+        return 1.0 / sqrt(float(size));
+    } else {
+        return sqrt(2.0 / float(size)) * cos((2.0 * float(j) + 1.0) * float(i) * M_PI / (2.0 * float(size)));
+    }
 }
 
-/* ── 4x4 IDCT (one thread per row) ─────────────────────────────────────── */
-void idct4x4(uint row)
-{
-    uint base = pc.block_offset + row * 4;
-    int c0 = int(coeff[base + 0]) * pc.qstep;
-    int c1 = int(coeff[base + 1]) * pc.qstep;
-    int c2 = int(coeff[base + 2]) * pc.qstep;
-    int c3 = int(coeff[base + 3]) * pc.qstep;
-
-    /* Stage 1 */
-    int s0 = (c0 + c2) >> 1;
-    int s1 = (c0 - c2) >> 1;
-    int s2 = butterfly(c1, c3,  COS_PI_4_64,  COS_PI_16_64);
-    int s3 = butterfly(c1, c3, -COS_PI_16_64, COS_PI_4_64);
-
-    /* Stage 2 */
-    residual[base + 0] = int16_t(clamp(s0 + s2, -32768, 32767));
-    residual[base + 1] = int16_t(clamp(s1 + s3, -32768, 32767));
-    residual[base + 2] = int16_t(clamp(s1 - s3, -32768, 32767));
-    residual[base + 3] = int16_t(clamp(s0 - s2, -32768, 32767));
-}
+shared float shared_M[32][32];
+shared float shared_Y[32][32];
 
 void main()
 {
-    uint tid = gl_GlobalInvocationID.x;
-    uint block_area = pc.block_size * pc.block_size;
+    uint tid = gl_LocalInvocationID.x;
+    uint N = pc.block_size;
 
-    /* Each invocation handles one row of the assigned block */
-    if (tid >= pc.block_size) return;
+    if (tid >= N) return;
 
-    if (pc.block_size == 4) {
-        idct4x4(tid);
+    // 1. Compute and store transform matrix M in shared memory
+    for (uint j = 0; j < N; j++) {
+        shared_M[tid][j] = get_matrix_val(tid, j, N);
     }
-    /* TODO: idct8x8, idct16x16, idct32x32 — to be implemented */
+
+    barrier();
+
+    // 2. Compute Y = M^T * In
+    for (uint col = 0; col < N; col++) {
+        float sum = 0.0;
+        for (uint k = 0; k < N; k++) {
+            int coeff_val = int(coeff[pc.block_offset + k * N + col]);
+            float dequant = float(coeff_val) * float(pc.qstep);
+            sum += shared_M[k][tid] * dequant;
+        }
+        shared_Y[tid][col] = sum;
+    }
+
+    barrier();
+
+    // 3. Compute Out = Y * M and add to dst_pixels
+    for (uint col = 0; col < N; col++) {
+        float sum = 0.0;
+        for (uint k = 0; k < N; k++) {
+            sum += shared_Y[tid][k] * shared_M[k][col];
+        }
+        
+        int rounded = int(round(sum));
+        uint pixel_offset = pc.dst_offset + tid * pc.dst_stride + col;
+        int pred_val = int(dst_pixels[pixel_offset]);
+        
+        dst_pixels[pixel_offset] = uint8_t(clamp(pred_val + rounded, 0, 255));
+    }
 }

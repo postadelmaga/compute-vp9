@@ -30,6 +30,34 @@ typedef struct {
     VkPipeline       pipe_loopfilter;
     VkPipelineLayout pipe_layout;
     VkDescriptorPool desc_pool;
+    VkDescriptorSetLayout desc_layout;
+
+    /* Frame buffers (YUV format) */
+    VkBuffer         ref_bufs[8];
+    VkDeviceMemory   ref_mems[8];
+    size_t           ref_sizes[8];
+    
+    VkBuffer         dst_buf;
+    VkDeviceMemory   dst_mem;
+    size_t           dst_size;
+    
+    /* Input buffers */
+    VkBuffer         coeff_buf;
+    VkDeviceMemory   coeff_mem;
+    VkBuffer         mv_buf;
+    VkDeviceMemory   mv_mem;
+
+    /* Temporary buffers for neighbor copy */
+    VkBuffer         above_buf;
+    VkDeviceMemory   above_mem;
+    VkBuffer         left_buf;
+    VkDeviceMemory   left_mem;
+
+    /* Current frame dimensions */
+    uint32_t         width;
+    uint32_t         height;
+    int64_t          pts;
+    int              has_frame;
 
     /* Output buffer (host-visible) */
     VkBuffer         output_buf;

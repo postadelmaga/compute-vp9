@@ -20,3 +20,5 @@ add_test(NAME test_backend_init      COMMAND test_decoder --test backend)
 add_test(NAME test_tile_parsing      COMMAND test_decoder --test tile_parsing)
 add_test(NAME test_decode_key_frame  COMMAND test_decoder --test keyframe
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME test_decode_key_frame_vulkan COMMAND test_decoder --test keyframe_vulkan
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
