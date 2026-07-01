@@ -43,18 +43,19 @@ uint bilinear(uint x, uint y, ivec2 sub)
     int fx = sub.x & 7;
     int fy = sub.y & 7;
 
-    uint p00 = ref_luma[clamp(y,     0u, pc.frame_height-1u) * pc.frame_width
-                       + clamp(x,     0u, pc.frame_width-1u)];
-    uint p10 = ref_luma[clamp(y,     0u, pc.frame_height-1u) * pc.frame_width
-                       + clamp(x+1u, 0u, pc.frame_width-1u)];
-    uint p01 = ref_luma[clamp(y+1u, 0u, pc.frame_height-1u) * pc.frame_width
-                       + clamp(x,     0u, pc.frame_width-1u)];
-    uint p11 = ref_luma[clamp(y+1u, 0u, pc.frame_height-1u) * pc.frame_width
-                       + clamp(x+1u, 0u, pc.frame_width-1u)];
+    uint y0 = clamp(y,     0u, pc.frame_height - 1u) * pc.frame_width;
+    uint y1 = clamp(y + 1u, 0u, pc.frame_height - 1u) * pc.frame_width;
+    uint x0 = clamp(x,     0u, pc.frame_width - 1u);
+    uint x1 = clamp(x + 1u, 0u, pc.frame_width - 1u);
+
+    uint p00 = uint(ref_luma[y0 + x0]);
+    uint p10 = uint(ref_luma[y0 + x1]);
+    uint p01 = uint(ref_luma[y1 + x0]);
+    uint p11 = uint(ref_luma[y1 + x1]);
 
     uint top = (p00 * (8u - uint(fx)) + p10 * uint(fx) + 4u) >> 3;
     uint bot = (p01 * (8u - uint(fx)) + p11 * uint(fx) + 4u) >> 3;
-    return    (top  * (8u - uint(fy)) + bot  * uint(fy) + 4u) >> 3;
+    return     (top * (8u - uint(fy)) + bot * uint(fy) + 4u) >> 3;
 }
 
 void main()

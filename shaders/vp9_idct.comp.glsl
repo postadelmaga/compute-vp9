@@ -29,14 +29,34 @@ layout(push_constant) uniform PushConst {
 #define M_PI 3.141592653589793
 
 float get_matrix_val(uint i, uint j, uint size) {
+    float c0, c1, angle_scale;
+    if (size == 4) {
+        c0 = 0.5;
+        c1 = 0.70710678;
+        angle_scale = 0.39269908;
+    } else if (size == 8) {
+        c0 = 0.35355339;
+        c1 = 0.5;
+        angle_scale = 0.19634954;
+    } else if (size == 16) {
+        c0 = 0.25;
+        c1 = 0.35355339;
+        angle_scale = 0.09817477;
+    } else { // size == 32
+        c0 = 0.17677669;
+        c1 = 0.25;
+        angle_scale = 0.049087385;
+    }
+
     if (i == 0) {
-        return 1.0 / sqrt(float(size));
+        return c0;
     } else {
-        return sqrt(2.0 / float(size)) * cos((2.0 * float(j) + 1.0) * float(i) * M_PI / (2.0 * float(size)));
+        return c1 * cos((2.0 * float(j) + 1.0) * float(i) * angle_scale);
     }
 }
 
 shared float shared_M[32][32];
+shared float shared_in[32][32];
 shared float shared_Y[32][32];
 
 void main()
@@ -51,22 +71,26 @@ void main()
         shared_M[tid][j] = get_matrix_val(tid, j, N);
     }
 
+    // 2. Load and dequantize input coefficients in coalesced manner
+    for (uint row = 0; row < N; row++) {
+        int coeff_val = int(coeff[pc.block_offset + row * N + tid]);
+        shared_in[row][tid] = float(coeff_val) * float(pc.qstep);
+    }
+
     barrier();
 
-    // 2. Compute Y = M^T * In
+    // 3. Compute Y = M^T * In
     for (uint col = 0; col < N; col++) {
         float sum = 0.0;
         for (uint k = 0; k < N; k++) {
-            int coeff_val = int(coeff[pc.block_offset + k * N + col]);
-            float dequant = float(coeff_val) * float(pc.qstep);
-            sum += shared_M[k][tid] * dequant;
+            sum += shared_M[k][tid] * shared_in[k][col];
         }
         shared_Y[tid][col] = sum;
     }
 
     barrier();
 
-    // 3. Compute Out = Y * M and add to dst_pixels
+    // 4. Compute Out = Y * M and add to dst_pixels
     for (uint col = 0; col < N; col++) {
         float sum = 0.0;
         for (uint k = 0; k < N; k++) {

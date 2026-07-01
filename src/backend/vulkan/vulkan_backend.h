@@ -31,6 +31,10 @@ typedef struct {
     VkPipelineLayout pipe_layout;
     VkDescriptorPool desc_pool;
     VkDescriptorSetLayout desc_layout;
+    VkDescriptorSet  desc_mc;
+    VkDescriptorSet  desc_intra;
+    VkDescriptorSet  desc_idct;
+    VkDescriptorSet  desc_lf;
 
     /* Frame buffers (YUV format) */
     VkBuffer         ref_bufs[8];
@@ -67,6 +71,7 @@ typedef struct {
 
     /* Command infrastructure */
     VkCommandPool    cmd_pool;
+    VkCommandBuffer  active_cmd;
     VkFence          fence;
 } vulkan_ctx_t;
 

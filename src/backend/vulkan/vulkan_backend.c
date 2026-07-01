@@ -387,6 +387,18 @@ cvp9_err_t vulkan_backend_init(void **ctx)
 
     vkCreateDescriptorPool(vk->device, &pool_info, NULL, &vk->desc_pool);
 
+    /* Allocate persistent descriptor sets */
+    vk->desc_mc = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
+    vk->desc_intra = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
+    vk->desc_idct = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
+    vk->desc_lf = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
+
+    if (vk->desc_mc == VK_NULL_HANDLE || vk->desc_intra == VK_NULL_HANDLE ||
+        vk->desc_idct == VK_NULL_HANDLE || vk->desc_lf == VK_NULL_HANDLE) {
+        vulkan_backend_destroy(vk);
+        return CVP9_ERR_GPU;
+    }
+
     /* Infrastructure */
     VkCommandPoolCreateInfo command_pool_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -477,6 +489,13 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     vulkan_ctx_t *vk = (vulkan_ctx_t *)ctx;
     if (!vk || !pf) return CVP9_ERR_INVALID_DATA;
 
+    /* Wait for previous frame's command buffer to finish if it hasn't already */
+    if (vk->active_cmd != VK_NULL_HANDLE) {
+        vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
+        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &vk->active_cmd);
+        vk->active_cmd = VK_NULL_HANDLE;
+    }
+
     ensure_buffers(vk, pf->hdr.width, pf->hdr.height);
 
     vk->pts = pts;
@@ -518,6 +537,23 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
         vkUnmapMemory(vk->device, vk->mv_mem);
     }
 
+    /* Update descriptor sets once per frame */
+    bind_buffer_to_descriptor(vk->device, vk->desc_mc, 0, vk->ref_bufs[0], vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, vk->desc_mc, 1, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, vk->desc_mc, 2, vk->mv_buf, mv_size);
+
+    bind_buffer_to_descriptor(vk->device, vk->desc_intra, 0, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, vk->desc_intra, 1, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, vk->desc_intra, 2, vk->dst_buf, vk->dst_size);
+
+    bind_buffer_to_descriptor(vk->device, vk->desc_idct, 0, vk->coeff_buf, coeff_size);
+    bind_buffer_to_descriptor(vk->device, vk->desc_idct, 1, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, vk->desc_idct, 2, vk->dst_buf, vk->dst_size);
+
+    bind_buffer_to_descriptor(vk->device, vk->desc_lf, 0, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, vk->desc_lf, 1, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, vk->desc_lf, 2, vk->dst_buf, vk->dst_size);
+
     /* Record command buffer */
     VkCommandBufferAllocateInfo cmd_alloc = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -534,12 +570,13 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     };
     vkBeginCommandBuffer(cmd, &begin_info);
 
-    /* 1. Motion Compensation (Inter prediction) */
-    VkDescriptorSet desc_mc = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
-    bind_buffer_to_descriptor(vk->device, desc_mc, 0, vk->ref_bufs[0], vk->dst_size);
-    bind_buffer_to_descriptor(vk->device, desc_mc, 1, vk->dst_buf, vk->dst_size);
-    bind_buffer_to_descriptor(vk->device, desc_mc, 2, vk->mv_buf, mv_size);
+    VkMemoryBarrier mem_barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+    };
 
+    /* 1. Motion Compensation (Inter prediction) */
     struct {
         uint32_t width;
         uint32_t height;
@@ -553,52 +590,28 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     };
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_mc);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &desc_mc, 0, NULL);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_mc, 0, NULL);
     vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_mc), &pc_mc);
     vkCmdDispatch(cmd, (vk->width + 7) / 8, (vk->height + 7) / 8, 1);
 
-    VkMemoryBarrier mem_barrier = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
-    };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &mem_barrier, 0, NULL, 0, NULL);
 
     /* 2. Block-by-block Intra Prediction and IDCT Residual Addition */
+    int need_barrier_before_intra = 0;
     for (uint32_t i = 0; i < pf->num_blocks; i++) {
         const vp9_macroblock_info_t *block = &pf->blocks[i];
         uint32_t block_size = block->width;
 
         if (block->is_intra) {
-            /* Copy neighbor pixels directly on the GPU */
-            if (block->y > 0) {
-                VkBufferCopy copy_region = {
-                    .srcOffset = (block->y - 1) * vk->width + block->x,
-                    .dstOffset = 0,
-                    .size = block_size
-                };
-                vkCmdCopyBuffer(cmd, vk->dst_buf, vk->above_buf, 1, &copy_region);
+            /* Synchronize if any IDCT ran since the last barrier, ensuring reconstructed neighbors are visible */
+            if (need_barrier_before_intra) {
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     0, 1, &mem_barrier, 0, NULL, 0, NULL);
+                need_barrier_before_intra = 0;
             }
-            if (block->x > 0) {
-                VkBufferCopy copy_regions[64];
-                for (uint32_t r = 0; r < block_size; r++) {
-                    copy_regions[r].srcOffset = (block->y + r) * vk->width + (block->x - 1);
-                    copy_regions[r].dstOffset = r;
-                    copy_regions[r].size = 1;
-                }
-                vkCmdCopyBuffer(cmd, vk->dst_buf, vk->left_buf, block_size, copy_regions);
-            }
-
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 0, 0, NULL, 0, NULL, 0, NULL);
 
             /* Dispatch Intra prediction */
-            VkDescriptorSet desc_intra = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
-            bind_buffer_to_descriptor(vk->device, desc_intra, 0, vk->above_buf, block_size);
-            bind_buffer_to_descriptor(vk->device, desc_intra, 1, vk->left_buf, block_size);
-            bind_buffer_to_descriptor(vk->device, desc_intra, 2, vk->dst_buf, vk->dst_size);
-
             struct {
                 uint32_t block_size;
                 uint32_t pred_mode;
@@ -612,19 +625,17 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
             };
 
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_intra);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &desc_intra, 0, NULL);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_intra, 0, NULL);
             vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_intra), &pc_intra);
             vkCmdDispatch(cmd, (block_size + 7) / 8, (block_size + 7) / 8, 1);
             
+            /* Must synchronize intra pred write before IDCT reads it for the same block */
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  0, 1, &mem_barrier, 0, NULL, 0, NULL);
         }
 
         /* Residual Addition (IDCT) */
         uint32_t tx_size = 1 << (block->tx_size + 2);
-        VkDescriptorSet desc_idct = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
-        bind_buffer_to_descriptor(vk->device, desc_idct, 0, vk->coeff_buf, coeff_size);
-        bind_buffer_to_descriptor(vk->device, desc_idct, 1, vk->dst_buf, vk->dst_size);
 
         struct {
             uint32_t block_size;
@@ -641,18 +652,21 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
         };
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_idct);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &desc_idct, 0, NULL);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_idct, 0, NULL);
         vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_idct), &pc_idct);
         vkCmdDispatch(cmd, 1, 1, 1);
 
+        /* Set flag to require barrier before any future intra block reads */
+        need_barrier_before_intra = 1;
+    }
+
+    /* Ensure all block reconstruction writes are completed before starting loop filtering */
+    if (need_barrier_before_intra) {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &mem_barrier, 0, NULL, 0, NULL);
     }
 
     /* 3. Deblocking Loop Filter */
-    VkDescriptorSet desc_lf = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout);
-    bind_buffer_to_descriptor(vk->device, desc_lf, 0, vk->dst_buf, vk->dst_size);
-
     struct {
         uint32_t frame_width;
         uint32_t frame_height;
@@ -670,7 +684,7 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     };
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_loopfilter);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &desc_lf, 0, NULL);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_lf, 0, NULL);
     
     /* Horizontal pass */
     vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_lf), &pc_lf);
@@ -705,7 +719,7 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
 
     vkEndCommandBuffer(cmd);
 
-    /* Submit and Synchronize */
+    /* Submit asynchronously */
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
@@ -719,9 +733,7 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
         return CVP9_ERR_GPU;
     }
     
-    vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
-    vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
-
+    vk->active_cmd = cmd;
     return CVP9_OK;
 }
 
@@ -730,6 +742,13 @@ cvp9_err_t vulkan_get_frame(void *ctx, cvp9_frame_info_t *info)
     vulkan_ctx_t *vk = (vulkan_ctx_t *)ctx;
     if (!vk || !vk->has_frame) return CVP9_ERR_UNSUPPORTED;
     
+    /* Synchronize and clean up the active command buffer */
+    if (vk->active_cmd != VK_NULL_HANDLE) {
+        vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
+        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &vk->active_cmd);
+        vk->active_cmd = VK_NULL_HANDLE;
+    }
+
     cvp9_frame_alloc(info, vk->width, vk->height);
     info->pts = vk->pts;
     
