@@ -22,6 +22,9 @@ struct cvp9_ctx {
     cvp9_backend_t   backend;
     vp9_frame_header_t last_frame_hdr;
 
+    uint32_t         width;
+    uint32_t         height;
+
     /* Entropy probabilities and parsed metadata context */
     vp9_entropy_probs_t probs;
     vp9_parsed_frame_t *parsed_frame;
@@ -120,6 +123,14 @@ cvp9_err_t cvp9_decode(cvp9_ctx_t *ctx,
 
     vp9_frame_header_t *hdr = &ctx->last_frame_hdr;
 
+    if (hdr->width > 0 && hdr->height > 0) {
+        ctx->width = hdr->width;
+        ctx->height = hdr->height;
+    } else {
+        hdr->width = ctx->width;
+        hdr->height = ctx->height;
+    }
+
     /* 1. Allocate or resize parsed_frame if dimensions changed */
     if (!ctx->parsed_frame || ctx->parsed_frame->hdr.width != hdr->width || ctx->parsed_frame->hdr.height != hdr->height) {
         if (ctx->parsed_frame) vp9_parsed_frame_free(ctx->parsed_frame);
@@ -145,6 +156,9 @@ cvp9_err_t cvp9_decode(cvp9_ctx_t *ctx,
     /* 3. Parse tiles and macroblocks/coefficients */
     int parse_rc = vp9_decode_tiles(hdr, tile_data, tile_size, &ctx->probs, ctx->parsed_frame);
     if (parse_rc != 0) return CVP9_ERR_INVALID_DATA;
+
+    /* Adapt entropy probabilities for the next frame */
+    vp9_adapt_probabilities(&ctx->probs, ctx->parsed_frame);
 
     /* 4. Dispatch to compute backend or CPU fallback */
     cvp9_err_t err = CVP9_ERR_UNSUPPORTED;
@@ -234,3 +248,116 @@ const char *cvp9_err_str(cvp9_err_t err)
     default:                    return "Unknown error";
     }
 }
+
+#ifdef ENABLE_VAAPI
+cvp9_err_t cvp9_decode_vaapi(cvp9_ctx_t *ctx,
+                             const uint8_t *data, size_t size,
+                             int64_t pts,
+                             const VADecPictureParameterBufferVP9 *pic_param,
+                             const VASliceParameterBufferVP9 *slice_param)
+{
+    if (!ctx || !data || size == 0 || !pic_param || !slice_param)
+        return CVP9_ERR_INVALID_DATA;
+
+    /* 1. Populate ctx->last_frame_hdr from VA-API picture parameters */
+    vp9_frame_header_t *hdr = &ctx->last_frame_hdr;
+    memset(hdr, 0, sizeof(*hdr));
+
+    hdr->frame_type = pic_param->pic_fields.bits.frame_type ? VP9_FRAME_NON_KEY : VP9_FRAME_KEY;
+    hdr->width = pic_param->frame_width;
+    hdr->height = pic_param->frame_height;
+
+    if (hdr->width > 0 && hdr->height > 0) {
+        ctx->width = hdr->width;
+        ctx->height = hdr->height;
+    } else {
+        hdr->width = ctx->width;
+        hdr->height = ctx->height;
+    }
+    hdr->profile = pic_param->profile;
+    hdr->bit_depth = pic_param->bit_depth;
+    hdr->show_frame = pic_param->pic_fields.bits.show_frame;
+    hdr->error_resilient = pic_param->pic_fields.bits.error_resilient_mode;
+    hdr->log2_tile_cols = pic_param->log2_tile_columns;
+    hdr->log2_tile_rows = pic_param->log2_tile_rows;
+
+    hdr->filter_level = pic_param->filter_level;
+    hdr->sharpness_level = pic_param->sharpness_level;
+    hdr->segmentation_enabled = pic_param->pic_fields.bits.segmentation_enabled;
+
+    /* 2. Allocate or resize parsed_frame if dimensions changed */
+    if (!ctx->parsed_frame || ctx->parsed_frame->hdr.width != hdr->width || ctx->parsed_frame->hdr.height != hdr->height) {
+        if (ctx->parsed_frame) vp9_parsed_frame_free(ctx->parsed_frame);
+        ctx->parsed_frame = vp9_parsed_frame_alloc(hdr->width, hdr->height);
+        if (!ctx->parsed_frame) return CVP9_ERR_NOMEM;
+        
+        /* Initialize default entropy probabilities */
+        vp9_entropy_probs_init(&ctx->probs);
+    }
+
+    /* 3. Parse tiles from the bitstream using the range coder/entropy parser */
+    size_t tile_data_offset = slice_param->slice_data_offset + pic_param->first_partition_size;
+    if (tile_data_offset >= size) {
+        tile_data_offset = 0;
+    }
+    const uint8_t *tile_data = data + tile_data_offset;
+    size_t tile_size = size - tile_data_offset;
+
+    int parse_rc = vp9_decode_tiles(hdr, tile_data, tile_size, &ctx->probs, ctx->parsed_frame);
+    if (parse_rc != 0) return CVP9_ERR_INVALID_DATA;
+
+    /* Adapt entropy probabilities for the next frame */
+    vp9_adapt_probabilities(&ctx->probs, ctx->parsed_frame);
+
+    /* 4. Dispatch to compute backend or CPU fallback */
+    cvp9_err_t err = CVP9_ERR_UNSUPPORTED;
+
+#ifdef ENABLE_VULKAN
+    if (ctx->backend == CVP9_BACKEND_VULKAN) {
+        err = vulkan_decode_frame(ctx->backend_ctx, ctx->parsed_frame, pts);
+    }
+#endif
+
+    if (err == CVP9_ERR_UNSUPPORTED) {
+        /* CPU reference decode & reconstruction */
+        cvp9_frame_info_t reconstructed_frame;
+        memset(&reconstructed_frame, 0, sizeof(reconstructed_frame));
+        
+        const cvp9_frame_info_t *refs[8];
+        for (int i = 0; i < 8; i++) {
+            refs[i] = &ctx->ref_frames[i];
+        }
+        
+        if (!vp9_reconstruct_frame(ctx->parsed_frame, refs, &reconstructed_frame)) {
+            return CVP9_ERR_NOMEM;
+        }
+        reconstructed_frame.pts = pts;
+
+        /* Update reference frame pool based on keyframe status */
+        if (hdr->frame_type == VP9_FRAME_KEY) {
+            for (int i = 0; i < 8; i++) {
+                cvp9_frame_copy(&ctx->ref_frames[i], &reconstructed_frame);
+            }
+        } else {
+            cvp9_frame_copy(&ctx->ref_frames[0], &reconstructed_frame);
+        }
+
+        /* Push to output queue (ring buffer, capacity 4) */
+        if (ctx->frame_count < 4) {
+            cvp9_frame_copy(&ctx->frames[ctx->frame_wr], &reconstructed_frame);
+            ctx->frame_wr = (ctx->frame_wr + 1) % 4;
+            ctx->frame_count++;
+        } else {
+            cvp9_frame_free(&ctx->frames[ctx->frame_rd]);
+            cvp9_frame_copy(&ctx->frames[ctx->frame_rd], &reconstructed_frame);
+            ctx->frame_rd = (ctx->frame_rd + 1) % 4;
+            ctx->frame_wr = ctx->frame_rd;
+        }
+        
+        cvp9_frame_free(&reconstructed_frame);
+        err = CVP9_OK;
+    }
+
+    return err;
+}
+#endif

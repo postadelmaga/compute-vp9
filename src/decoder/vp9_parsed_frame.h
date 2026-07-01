@@ -48,6 +48,12 @@ typedef struct {
     cvp9_mv_t              *mv_grid;
     uint32_t                mv_grid_width;
     uint32_t                mv_grid_height;
+
+    /* ModeInfo grid for tracking block dimensions (8x8 pixel units) */
+    uint8_t                *mi_width_grid;
+    uint8_t                *mi_height_grid;
+    uint32_t                mi_grid_width;
+    uint32_t                mi_grid_height;
 } vp9_parsed_frame_t;
 
 /* ── Constructor/Destructor ──────────────────────────────────────────────── */

@@ -81,6 +81,16 @@ cvp9_err_t cvp9_decode(cvp9_ctx_t *ctx,
                         const uint8_t *data, size_t size,
                         int64_t pts);
 
+#ifdef ENABLE_VAAPI
+#include <va/va.h>
+#include <va/va_dec_vp9.h>
+cvp9_err_t cvp9_decode_vaapi(cvp9_ctx_t *ctx,
+                             const uint8_t *data, size_t size,
+                             int64_t pts,
+                             const VADecPictureParameterBufferVP9 *pic_param,
+                             const VASliceParameterBufferVP9 *slice_param);
+#endif
+
 /**
  * Retrieve the next decoded frame, if available.
  * @param ctx    Decoder context

@@ -19,6 +19,12 @@ vp9_parsed_frame_t *vp9_parsed_frame_alloc(uint32_t width, uint32_t height)
         return NULL;
     }
 
+    pf->mi_grid_width = (width + 7) / 8;
+    pf->mi_grid_height = (height + 7) / 8;
+    uint32_t mi_size = pf->mi_grid_width * pf->mi_grid_height;
+    pf->mi_width_grid = calloc(mi_size, sizeof(uint8_t));
+    pf->mi_height_grid = calloc(mi_size, sizeof(uint8_t));
+
     /* Initial capacities */
     pf->blocks_capacity = 256;
     pf->blocks = malloc(pf->blocks_capacity * sizeof(*pf->blocks));
@@ -26,7 +32,7 @@ vp9_parsed_frame_t *vp9_parsed_frame_alloc(uint32_t width, uint32_t height)
     pf->coeffs_capacity = 4096;
     pf->coeffs = malloc(pf->coeffs_capacity * sizeof(*pf->coeffs));
 
-    if (!pf->blocks || !pf->coeffs) {
+    if (!pf->blocks || !pf->coeffs || !pf->mi_width_grid || !pf->mi_height_grid) {
         vp9_parsed_frame_free(pf);
         return NULL;
     }
@@ -40,6 +46,8 @@ void vp9_parsed_frame_free(vp9_parsed_frame_t *pf)
     free(pf->blocks);
     free(pf->coeffs);
     free(pf->mv_grid);
+    free(pf->mi_width_grid);
+    free(pf->mi_height_grid);
     free(pf);
 }
 
@@ -49,6 +57,9 @@ void vp9_parsed_frame_reset(vp9_parsed_frame_t *pf)
     pf->num_blocks = 0;
     pf->num_coeffs = 0;
     memset(pf->mv_grid, 0, pf->mv_grid_width * pf->mv_grid_height * sizeof(cvp9_mv_t));
+    uint32_t mi_size = pf->mi_grid_width * pf->mi_grid_height;
+    memset(pf->mi_width_grid, 0, mi_size * sizeof(uint8_t));
+    memset(pf->mi_height_grid, 0, mi_size * sizeof(uint8_t));
     memset(&pf->hdr, 0, sizeof(pf->hdr));
 }
 

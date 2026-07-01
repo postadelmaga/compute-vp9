@@ -22,3 +22,13 @@ add_test(NAME test_decode_key_frame  COMMAND test_decoder --test keyframe
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME test_decode_key_frame_vulkan COMMAND test_decoder --test keyframe_vulkan
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ── Benchmark executable ──────────────────────────────────────────────────────
+add_executable(benchmark_vp9
+    benchmark.c
+)
+target_link_libraries(benchmark_vp9 PRIVATE compute_vp9)
+target_include_directories(benchmark_vp9 PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
+)

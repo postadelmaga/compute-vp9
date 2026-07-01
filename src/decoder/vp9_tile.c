@@ -107,10 +107,36 @@ void vp9_decode_partition(vpx_reader *r, int mi_row, int mi_col, int size_mi,
     if (size_mi == 1) {
         partition = PARTITION_NONE;
     } else if (has_rows && has_cols) {
-        /* Standard 4-way split decision (simplified) */
-        int bit0 = vpx_read(r, 128);
-        int bit1 = vpx_read(r, 128);
-        partition = (vp9_partition_t)((bit0 << 1) | bit1);
+        /* Standard-conformant context-dependent partition decision */
+        int size_group = 3;
+        if (size_mi == 8)      size_group = 0;
+        else if (size_mi == 4) size_group = 1;
+        else if (size_mi == 2) size_group = 2;
+
+        bool above_has_smaller_block = false;
+        if (mi_row > 0) {
+            uint32_t above_idx = (mi_row - 1) * pf->mi_grid_width + mi_col;
+            uint32_t above_w = pf->mi_width_grid[above_idx];
+            above_has_smaller_block = (above_w > 0 && above_w < size_mi * 8);
+        }
+        bool left_has_smaller_block = false;
+        if (mi_col > 0) {
+            uint32_t left_idx = mi_row * pf->mi_grid_width + (mi_col - 1);
+            uint32_t left_h = pf->mi_height_grid[left_idx];
+            left_has_smaller_block = (left_h > 0 && left_h < size_mi * 8);
+        }
+        int ctx = (left_has_smaller_block ? 2 : 0) + (above_has_smaller_block ? 1 : 0);
+
+        int p_offset = size_group * 4 + ctx;
+        const uint8_t *p = probs->partition_probs[p_offset];
+
+        if (vpx_read(r, p[0])) {
+            partition = PARTITION_SPLIT;
+        } else if (vpx_read(r, p[1])) {
+            partition = vpx_read(r, p[2]) ? PARTITION_VERT : PARTITION_HORZ;
+        } else {
+            partition = PARTITION_NONE;
+        }
     } else if (!has_rows && has_cols) {
         partition = PARTITION_HORZ;
     } else if (has_rows && !has_cols) {
@@ -146,6 +172,68 @@ void vp9_decode_partition(vpx_reader *r, int mi_row, int mi_col, int size_mi,
     }
 }
 
+static const vp9_macroblock_info_t *find_block_at(const vp9_parsed_frame_t *pf, int x, int y)
+{
+    if (x < 0 || y < 0) return NULL;
+    for (uint32_t i = 0; i < pf->num_blocks; i++) {
+        const vp9_macroblock_info_t *b = &pf->blocks[i];
+        if (x >= b->x && x < b->x + b->width && y >= b->y && y < b->y + b->height) {
+            return b;
+        }
+    }
+    return NULL;
+}
+
+static int get_y_mode_context(const vp9_macroblock_info_t *above, const vp9_macroblock_info_t *left)
+{
+    uint8_t above_mode = above ? (above->is_intra ? above->y_mode : DC_PRED) : DC_PRED;
+    uint8_t left_mode = left ? (left->is_intra ? left->y_mode : DC_PRED) : DC_PRED;
+    
+    static const uint8_t mode_to_ctx[10] = {
+        0, 1, 2, 3, 4, 4, 4, 4, 4, 4
+    };
+    int above_ctx = mode_to_ctx[above_mode];
+    int left_ctx = mode_to_ctx[left_mode];
+    
+    return (above_ctx + left_ctx) >> 1;
+}
+
+static int get_inter_mode_context(const vp9_macroblock_info_t *above, const vp9_macroblock_info_t *left)
+{
+    int above_intra = above ? above->is_intra : 1;
+    int left_intra = left ? left->is_intra : 1;
+    
+    if (above_intra && left_intra) return 0;
+    if (above_intra || left_intra) return 2;
+    return 4;
+}
+
+static void vp9_find_mv_predictors(const vp9_parsed_frame_t *pf, int x, int y,
+                                   cvp9_mv_t *nearest, cvp9_mv_t *near)
+{
+    nearest->x = 0; nearest->y = 0;
+    near->x = 0; near->y = 0;
+
+    const vp9_macroblock_info_t *above = find_block_at(pf, x, y - 1);
+    const vp9_macroblock_info_t *left = find_block_at(pf, x - 1, y);
+
+    int count = 0;
+    if (above && !above->is_intra) {
+        nearest->x = above->mv[0][0];
+        nearest->y = above->mv[0][1];
+        count++;
+    }
+    if (left && !left->is_intra) {
+        if (count == 0) {
+            nearest->x = left->mv[0][0];
+            nearest->y = left->mv[0][1];
+        } else {
+            near->x = left->mv[0][0];
+            near->y = left->mv[0][1];
+        }
+    }
+}
+
 void vp9_decode_block(vpx_reader *r, int mi_row, int mi_col,
                       int width_mi, int height_mi,
                       const vp9_entropy_probs_t *probs,
@@ -165,10 +253,13 @@ void vp9_decode_block(vpx_reader *r, int mi_row, int mi_col,
     /* Read intra/inter flag */
     block->is_intra = !vpx_read(r, probs->intra_inter_probs[0]);
 
+    const vp9_macroblock_info_t *above_blk = find_block_at(pf, block->x, block->y - 1);
+    const vp9_macroblock_info_t *left_blk = find_block_at(pf, block->x - 1, block->y);
+
     if (block->is_intra) {
-        block->y_mode = vpx_read_literal(r, 4);
-        if (block->y_mode > 9) block->y_mode = 0; /* Fallback to DC */
-        block->uv_mode = block->y_mode;
+        int ctx_idx = get_y_mode_context(above_blk, left_blk);
+        block->y_mode = vp9_read_intra_mode(r, probs->y_mode_probs[ctx_idx]);
+        block->uv_mode = vp9_read_intra_mode(r, probs->uv_mode_probs[block->y_mode]);
 
         block->ref_frame[0] = 0;
         block->ref_frame[1] = 0;
@@ -178,14 +269,36 @@ void vp9_decode_block(vpx_reader *r, int mi_row, int mi_col,
         block->ref_frame[0] = vpx_read_bit(r) + 1;
         block->ref_frame[1] = 0;
 
-        /* Reconstruct Motion Vector (1/8-pel deltas) */
-        int mv_sign_x = vpx_read_bit(r);
-        int mv_val_x = vpx_read_literal(r, 6);
-        block->mv[0][0] = mv_sign_x ? -mv_val_x : mv_val_x;
+        /* Find motion vector predictors */
+        cvp9_mv_t nearest_mv, near_mv;
+        vp9_find_mv_predictors(pf, block->x, block->y, &nearest_mv, &near_mv);
 
-        int mv_sign_y = vpx_read_bit(r);
-        int mv_val_y = vpx_read_literal(r, 6);
-        block->mv[0][1] = mv_sign_y ? -mv_val_y : mv_val_y;
+        /* Read inter prediction mode */
+        int ctx_idx = get_inter_mode_context(above_blk, left_blk);
+        int mode = vp9_read_inter_mode(r, probs->inter_mode_probs[ctx_idx]);
+        block->y_mode = mode; // Store inter mode in y_mode for consistency
+
+        if (mode == ZEROMV) {
+            block->mv[0][0] = 0;
+            block->mv[0][1] = 0;
+        } else if (mode == NEARESTMV) {
+            block->mv[0][0] = nearest_mv.x;
+            block->mv[0][1] = nearest_mv.y;
+        } else if (mode == NEARMV) {
+            block->mv[0][0] = near_mv.x;
+            block->mv[0][1] = near_mv.y;
+        } else { /* NEWMV: parse delta from stream and add to nearest */
+            int mv_sign_x = vpx_read_bit(r);
+            int mv_val_x = vpx_read_literal(r, 6);
+            int delta_x = mv_sign_x ? -mv_val_x : mv_val_x;
+
+            int mv_sign_y = vpx_read_bit(r);
+            int mv_val_y = vpx_read_literal(r, 6);
+            int delta_y = mv_sign_y ? -mv_val_y : mv_val_y;
+
+            block->mv[0][0] = nearest_mv.x + delta_x;
+            block->mv[0][1] = nearest_mv.y + delta_y;
+        }
 
         /* Write motion vector to grid for GPU motion compensation */
         int start_gx = block->x / 4;
@@ -237,6 +350,19 @@ void vp9_decode_block(vpx_reader *r, int mi_row, int mi_col,
                     if (eob > block->eob) block->eob = eob;
                     pf->num_coeffs += tx_area;
                 }
+            }
+        }
+    }
+
+    /* Save block dimensions to ModeInfo grid for neighbor context calculation */
+    int end_mi_row = mi_row + height_mi;
+    int end_mi_col = mi_col + width_mi;
+    for (int r = mi_row; r < end_mi_row; r++) {
+        for (int c = mi_col; c < end_mi_col; c++) {
+            if (r < (int)pf->mi_grid_height && c < (int)pf->mi_grid_width) {
+                uint32_t idx = r * pf->mi_grid_width + c;
+                pf->mi_width_grid[idx] = block->width;
+                pf->mi_height_grid[idx] = block->height;
             }
         }
     }

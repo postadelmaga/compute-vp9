@@ -37,7 +37,7 @@ uint sample_top_left() {
 
 void main()
 {
-    uvec2 pos = gl_LocalInvocationID.xy;
+    uvec2 pos = gl_GlobalInvocationID.xy;
     if (pos.x >= pc.block_size || pos.y >= pc.block_size) return;
 
     uint val = 128u; /* fallback: mid-grey */

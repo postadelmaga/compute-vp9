@@ -4,6 +4,7 @@
 #include "vp9_entropy.h"
 #include <stdlib.h>
 #include <string.h>
+#include "vp9_parsed_frame.h"
 
 /* Scan tables allocated globally and generated dynamically on first use */
 uint16_t vp9_default_scan_4x4[16];
@@ -49,12 +50,14 @@ void vp9_entropy_probs_init(vp9_entropy_probs_t *probs)
 {
     init_scans();
     
-    /* Initialize all probabilities to neutral 50/50 (128) */
     memset(probs->coef_probs, 128, sizeof(probs->coef_probs));
     memset(probs->skip_probs, 128, sizeof(probs->skip_probs));
     memset(probs->intra_inter_probs, 128, sizeof(probs->intra_inter_probs));
     memset(probs->tx_probs, 128, sizeof(probs->tx_probs));
     memset(probs->partition_probs, 128, sizeof(probs->partition_probs));
+    memset(probs->y_mode_probs, 128, sizeof(probs->y_mode_probs));
+    memset(probs->uv_mode_probs, 128, sizeof(probs->uv_mode_probs));
+    memset(probs->inter_mode_probs, 128, sizeof(probs->inter_mode_probs));
 }
 
 /* VP9 coefficient Huffman tree decisions */
@@ -221,3 +224,71 @@ int vp9_decode_tx_block(vpx_reader *r, int tx_size, int plane_type, int ref_type
 
     return eob;
 }
+
+int vp9_read_intra_mode(vpx_reader *r, const uint8_t probs[9])
+{
+    static const int8_t tree[] = {
+        -DC_PRED, 2,
+        -V_PRED, 4,
+        -H_PRED, 6,
+        -D45_PRED, 8,
+        -D135_PRED, 10,
+        -D117_PRED, 12,
+        -D127_PRED, 14,
+        -D207_PRED, 16,
+        -D63_PRED, -TM_PRED
+    };
+    
+    int i = 0;
+    while ((i = tree[i + vpx_read(r, probs[i >> 1])]) > 0)
+        ;
+    return -i;
+}
+
+int vp9_read_inter_mode(vpx_reader *r, const uint8_t probs[3])
+{
+    static const int8_t tree[] = {
+        -NEARESTMV, 2,
+        -NEARMV, 4,
+        -ZEROMV, -NEWMV
+    };
+    
+    int i = 0;
+    while ((i = tree[i + vpx_read(r, probs[i >> 1])]) > 0)
+        ;
+    return -i;
+}
+
+static uint8_t adapt_prob(uint8_t prob, int count0, int count1)
+{
+    int total = count0 + count1;
+    if (total == 0) return prob;
+    
+    int percentage = (count0 * 256 + (total >> 1)) / total;
+    if (percentage < 1) percentage = 1;
+    if (percentage > 255) percentage = 255;
+    
+    int factor = 15;
+    return (uint8_t)((prob * factor + percentage) / (factor + 1));
+}
+
+void vp9_adapt_probabilities(vp9_entropy_probs_t *probs, const vp9_parsed_frame_t *pf)
+{
+    if (pf->num_blocks == 0) return;
+
+    /* 1. Adapt skip probabilities */
+    int skip_count[2] = {0};
+    /* 2. Adapt intra/inter probabilities */
+    int intra_inter_count[2] = {0};
+
+    for (uint32_t i = 0; i < pf->num_blocks; i++) {
+        const vp9_macroblock_info_t *block = &pf->blocks[i];
+        if (block->skip) skip_count[1]++; else skip_count[0]++;
+        if (block->is_intra) intra_inter_count[0]++; else intra_inter_count[1]++;
+    }
+
+    probs->skip_probs[0] = adapt_prob(probs->skip_probs[0], skip_count[0], skip_count[1]);
+    probs->intra_inter_probs[0] = adapt_prob(probs->intra_inter_probs[0], intra_inter_count[0], intra_inter_count[1]);
+}
+
+

@@ -64,43 +64,49 @@ void main()
     uint tid = gl_LocalInvocationID.x;
     uint N = pc.block_size;
 
-    if (tid >= N) return;
-
     // 1. Compute and store transform matrix M in shared memory
-    for (uint j = 0; j < N; j++) {
-        shared_M[tid][j] = get_matrix_val(tid, j, N);
+    if (tid < N) {
+        for (uint j = 0; j < N; j++) {
+            shared_M[tid][j] = get_matrix_val(tid, j, N);
+        }
     }
 
     // 2. Load and dequantize input coefficients in coalesced manner
-    for (uint row = 0; row < N; row++) {
-        int coeff_val = int(coeff[pc.block_offset + row * N + tid]);
-        shared_in[row][tid] = float(coeff_val) * float(pc.qstep);
+    if (tid < N) {
+        for (uint row = 0; row < N; row++) {
+            int coeff_val = int(coeff[pc.block_offset + row * N + tid]);
+            shared_in[row][tid] = float(coeff_val) * float(pc.qstep);
+        }
     }
 
     barrier();
 
     // 3. Compute Y = M^T * In
-    for (uint col = 0; col < N; col++) {
-        float sum = 0.0;
-        for (uint k = 0; k < N; k++) {
-            sum += shared_M[k][tid] * shared_in[k][col];
+    if (tid < N) {
+        for (uint col = 0; col < N; col++) {
+            float sum = 0.0;
+            for (uint k = 0; k < N; k++) {
+                sum += shared_M[k][tid] * shared_in[k][col];
+            }
+            shared_Y[tid][col] = sum;
         }
-        shared_Y[tid][col] = sum;
     }
 
     barrier();
 
     // 4. Compute Out = Y * M and add to dst_pixels
-    for (uint col = 0; col < N; col++) {
-        float sum = 0.0;
-        for (uint k = 0; k < N; k++) {
-            sum += shared_Y[tid][k] * shared_M[k][col];
+    if (tid < N) {
+        for (uint col = 0; col < N; col++) {
+            float sum = 0.0;
+            for (uint k = 0; k < N; k++) {
+                sum += shared_Y[tid][k] * shared_M[k][col];
+            }
+            
+            int rounded = int(round(sum));
+            uint pixel_offset = pc.dst_offset + tid * pc.dst_stride + col;
+            int pred_val = int(dst_pixels[pixel_offset]);
+            
+            dst_pixels[pixel_offset] = uint8_t(clamp(pred_val + rounded, 0, 255));
         }
-        
-        int rounded = int(round(sum));
-        uint pixel_offset = pc.dst_offset + tid * pc.dst_stride + col;
-        int pred_val = int(dst_pixels[pixel_offset]);
-        
-        dst_pixels[pixel_offset] = uint8_t(clamp(pred_val + rounded, 0, 255));
     }
 }

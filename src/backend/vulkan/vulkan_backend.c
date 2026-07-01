@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include "decoder/vp9_frame.h"
 
 /* Helper: load SPIR-V shader module from the build directory */
@@ -67,7 +68,6 @@ static uint32_t find_memory_type(VkPhysicalDevice phys, uint32_t type_filter, Vk
     return (uint32_t)-1;
 }
 
-/* Helper: create Vulkan buffer and allocate memory */
 static VkResult create_buffer(VkDevice device, VkPhysicalDevice phys, VkDeviceSize size,
                              VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
                              VkBuffer *buffer, VkDeviceMemory *memory)
@@ -85,16 +85,35 @@ static VkResult create_buffer(VkDevice device, VkPhysicalDevice phys, VkDeviceSi
     VkMemoryRequirements mem_reqs;
     vkGetBufferMemoryRequirements(device, *buffer, &mem_reqs);
     
+    uint32_t mem_type = find_memory_type(phys, mem_reqs.memoryTypeBits, properties);
+    if (mem_type == (uint32_t)-1) {
+        fprintf(stderr, "[compute-vp9] find_memory_type failed! size: %lu, filter: 0x%X, properties: 0x%X\n",
+                (unsigned long)size, mem_reqs.memoryTypeBits, properties);
+        vkDestroyBuffer(device, *buffer, NULL);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    
     VkMemoryAllocateInfo alloc_info = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = mem_reqs.size,
-        .memoryTypeIndex = find_memory_type(phys, mem_reqs.memoryTypeBits, properties)
+        .memoryTypeIndex = mem_type
     };
     
     res = vkAllocateMemory(device, &alloc_info, NULL, memory);
-    if (res != VK_SUCCESS) return res;
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "[compute-vp9] vkAllocateMemory failed! res: %d, size: %lu, req_size: %lu, alignment: %lu, mem_type: %u\n",
+                res, (unsigned long)size, (unsigned long)mem_reqs.size, (unsigned long)mem_reqs.alignment, mem_type);
+        vkDestroyBuffer(device, *buffer, NULL);
+        return res;
+    }
     
-    return vkBindBufferMemory(device, *buffer, *memory, 0);
+    res = vkBindBufferMemory(device, *buffer, *memory, 0);
+    if (res != VK_SUCCESS) {
+        vkFreeMemory(device, *memory, NULL);
+        vkDestroyBuffer(device, *buffer, NULL);
+        return res;
+    }
+    return VK_SUCCESS;
 }
 
 /* Helper: allocate a descriptor set */
@@ -133,30 +152,34 @@ static void bind_buffer_to_descriptor(VkDevice device, VkDescriptorSet set, uint
 }
 
 /* Ensure buffers are allocated and of the correct size */
-static void ensure_buffers(vulkan_ctx_t *vk, uint32_t width, uint32_t height)
+static VkResult ensure_buffers(vulkan_ctx_t *vk, uint32_t width, uint32_t height)
 {
     if (vk->width == width && vk->height == height && vk->dst_buf != VK_NULL_HANDLE) {
-        return;
+        return VK_SUCCESS;
     }
     
     /* Clean up old buffers */
     if (vk->dst_buf != VK_NULL_HANDLE) {
         vkDestroyBuffer(vk->device, vk->dst_buf, NULL);
         vkFreeMemory(vk->device, vk->dst_mem, NULL);
+        vk->dst_buf = VK_NULL_HANDLE;
     }
     for (int i = 0; i < 8; i++) {
         if (vk->ref_bufs[i] != VK_NULL_HANDLE) {
             vkDestroyBuffer(vk->device, vk->ref_bufs[i], NULL);
             vkFreeMemory(vk->device, vk->ref_mems[i], NULL);
+            vk->ref_bufs[i] = VK_NULL_HANDLE;
         }
     }
     if (vk->above_buf != VK_NULL_HANDLE) {
         vkDestroyBuffer(vk->device, vk->above_buf, NULL);
         vkFreeMemory(vk->device, vk->above_mem, NULL);
+        vk->above_buf = VK_NULL_HANDLE;
     }
     if (vk->left_buf != VK_NULL_HANDLE) {
         vkDestroyBuffer(vk->device, vk->left_buf, NULL);
         vkFreeMemory(vk->device, vk->left_mem, NULL);
+        vk->left_buf = VK_NULL_HANDLE;
     }
     
     vk->width = width;
@@ -165,37 +188,65 @@ static void ensure_buffers(vulkan_ctx_t *vk, uint32_t width, uint32_t height)
     size_t yuv_size = width * height + 2 * ((width + 1) / 2) * ((height + 1) / 2);
     vk->dst_size = yuv_size;
 
-    create_buffer(vk->device, vk->phys_device, yuv_size,
+    VkResult res = create_buffer(vk->device, vk->phys_device, yuv_size,
                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                   &vk->dst_buf, &vk->dst_mem);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "[compute-vp9] Failed to create dst_buf: %d\n", res);
+        return res;
+    }
                   
     for (int i = 0; i < 8; i++) {
         vk->ref_sizes[i] = yuv_size;
-        create_buffer(vk->device, vk->phys_device, yuv_size,
+        res = create_buffer(vk->device, vk->phys_device, yuv_size,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                       &vk->ref_bufs[i], &vk->ref_mems[i]);
+        if (res != VK_SUCCESS) {
+            fprintf(stderr, "[compute-vp9] Failed to create ref_buf[%d]: %d\n", i, res);
+            return res;
+        }
     }
 
-    create_buffer(vk->device, vk->phys_device, 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    res = create_buffer(vk->device, vk->phys_device, 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                   &vk->above_buf, &vk->above_mem);
-    create_buffer(vk->device, vk->phys_device, 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "[compute-vp9] Failed to create above_buf: %d\n", res);
+        return res;
+    }
+
+    res = create_buffer(vk->device, vk->phys_device, 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                   &vk->left_buf, &vk->left_mem);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "[compute-vp9] Failed to create left_buf: %d\n", res);
+        return res;
+    }
     
     if (vk->output_buf != VK_NULL_HANDLE) {
         vkUnmapMemory(vk->device, vk->output_mem);
         vkDestroyBuffer(vk->device, vk->output_buf, NULL);
         vkFreeMemory(vk->device, vk->output_mem, NULL);
+        vk->output_buf = VK_NULL_HANDLE;
     }
     vk->output_size = yuv_size;
-    create_buffer(vk->device, vk->phys_device, yuv_size,
+    res = create_buffer(vk->device, vk->phys_device, yuv_size,
                   VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   &vk->output_buf, &vk->output_mem);
-    vkMapMemory(vk->device, vk->output_mem, 0, yuv_size, 0, &vk->output_mapped);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "[compute-vp9] Failed to create output_buf: %d\n", res);
+        return res;
+    }
+    res = vkMapMemory(vk->device, vk->output_mem, 0, yuv_size, 0, &vk->output_mapped);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "[compute-vp9] Failed to map output_mem: %d\n", res);
+        return res;
+    }
+
+    return VK_SUCCESS;
 }
 
 cvp9_err_t vulkan_backend_init(void **ctx)
@@ -233,7 +284,39 @@ cvp9_err_t vulkan_backend_init(void **ctx)
 
     VkPhysicalDevice *devices = malloc(sizeof(VkPhysicalDevice) * device_count);
     vkEnumeratePhysicalDevices(vk->instance, &device_count, devices);
-    vk->phys_device = devices[0];
+
+    const char *preferred_vendor = getenv("CVP9_GPU_VENDOR");
+    uint32_t selected_idx = 0;
+
+    printf("[compute-vp9] Available Vulkan GPUs:\n");
+    for (uint32_t i = 0; i < device_count; i++) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(devices[i], &props);
+
+        const char *vendor_name = "Unknown";
+        if (props.vendorID == 0x8086) vendor_name = "Intel";
+        else if (props.vendorID == 0x10DE) vendor_name = "NVIDIA";
+        else if (props.vendorID == 0x1002) vendor_name = "AMD";
+
+        printf("  [%u] %s (Vendor: %s, ID: 0x%04X, Type: %d)\n",
+               i, props.deviceName, vendor_name, props.vendorID, props.deviceType);
+
+        if (preferred_vendor) {
+            if (strcasecmp(preferred_vendor, "intel") == 0 && props.vendorID == 0x8086) {
+                selected_idx = i;
+            } else if (strcasecmp(preferred_vendor, "nvidia") == 0 && props.vendorID == 0x10DE) {
+                selected_idx = i;
+            } else if (strcasecmp(preferred_vendor, "amd") == 0 && props.vendorID == 0x1002) {
+                selected_idx = i;
+            }
+        }
+    }
+
+    vk->phys_device = devices[selected_idx];
+    VkPhysicalDeviceProperties selected_props;
+    vkGetPhysicalDeviceProperties(vk->phys_device, &selected_props);
+    printf("[compute-vp9] Selected Vulkan GPU: %s\n", selected_props.deviceName);
+
     free(devices);
 
     uint32_t queue_family_count = 0;
@@ -263,8 +346,20 @@ cvp9_err_t vulkan_backend_init(void **ctx)
         .pQueuePriorities = &queue_priority
     };
 
+    VkPhysicalDevice16BitStorageFeatures features16 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES,
+        .storageBuffer16BitAccess = VK_TRUE
+    };
+
+    VkPhysicalDevice8BitStorageFeatures features8 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES,
+        .pNext = &features16,
+        .storageBuffer8BitAccess = VK_TRUE
+    };
+
     VkDeviceCreateInfo device_create_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &features8,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queue_create_info
     };
@@ -356,16 +451,20 @@ cvp9_err_t vulkan_backend_init(void **ctx)
     };
 
     pipeline_create_info.stage.module = mod_idct;
-    vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_idct);
-
+    res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_idct);
+    if (res != VK_SUCCESS) fprintf(stderr, "[compute-vp9] Failed to create pipe_idct: %d\n", res);
+ 
     pipeline_create_info.stage.module = mod_mc;
-    vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_mc);
-
+    res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_mc);
+    if (res != VK_SUCCESS) fprintf(stderr, "[compute-vp9] Failed to create pipe_mc: %d\n", res);
+ 
     pipeline_create_info.stage.module = mod_intra;
-    vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_intra);
-
+    res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_intra);
+    if (res != VK_SUCCESS) fprintf(stderr, "[compute-vp9] Failed to create pipe_intra: %d\n", res);
+ 
     pipeline_create_info.stage.module = mod_loopfilter;
-    vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_loopfilter);
+    res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_loopfilter);
+    if (res != VK_SUCCESS) fprintf(stderr, "[compute-vp9] Failed to create pipe_loopfilter: %d\n", res);
     
     vkDestroyShaderModule(vk->device, mod_idct, NULL);
     vkDestroyShaderModule(vk->device, mod_mc, NULL);
@@ -491,12 +590,19 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
 
     /* Wait for previous frame's command buffer to finish if it hasn't already */
     if (vk->active_cmd != VK_NULL_HANDLE) {
-        vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
+        VkResult fence_res = vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
+        if (fence_res != VK_SUCCESS) {
+            fprintf(stderr, "[compute-vp9] vkWaitForFences failed: %d\n", fence_res);
+            return CVP9_ERR_GPU;
+        }
         vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &vk->active_cmd);
         vk->active_cmd = VK_NULL_HANDLE;
     }
 
-    ensure_buffers(vk, pf->hdr.width, pf->hdr.height);
+    VkResult res = ensure_buffers(vk, pf->hdr.width, pf->hdr.height);
+    if (res != VK_SUCCESS) {
+        return CVP9_ERR_GPU;
+    }
 
     vk->pts = pts;
     vk->has_frame = 1;
@@ -635,29 +741,31 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
         }
 
         /* Residual Addition (IDCT) */
-        uint32_t tx_size = 1 << (block->tx_size + 2);
+        if (!block->skip) {
+            uint32_t tx_size = 1 << (block->tx_size + 2);
 
-        struct {
-            uint32_t block_size;
-            int      qstep;
-            uint32_t block_offset;
-            uint32_t dst_stride;
-            uint32_t dst_offset;
-        } pc_idct = {
-            .block_size = tx_size,
-            .qstep = 128, /* quantization scale step */
-            .block_offset = block->coeff_offset,
-            .dst_stride = vk->width,
-            .dst_offset = block->y * vk->width + block->x
-        };
+            struct {
+                uint32_t block_size;
+                int      qstep;
+                uint32_t block_offset;
+                uint32_t dst_stride;
+                uint32_t dst_offset;
+            } pc_idct = {
+                .block_size = tx_size,
+                .qstep = 128, /* quantization scale step */
+                .block_offset = block->coeff_offset,
+                .dst_stride = vk->width,
+                .dst_offset = block->y * vk->width + block->x
+            };
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_idct);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_idct, 0, NULL);
-        vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_idct), &pc_idct);
-        vkCmdDispatch(cmd, 1, 1, 1);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_idct);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_idct, 0, NULL);
+            vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_idct), &pc_idct);
+            vkCmdDispatch(cmd, 1, 1, 1);
 
-        /* Set flag to require barrier before any future intra block reads */
-        need_barrier_before_intra = 1;
+            /* Set flag to require barrier before any future intra block reads */
+            need_barrier_before_intra = 1;
+        }
     }
 
     /* Ensure all block reconstruction writes are completed before starting loop filtering */
@@ -701,6 +809,15 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &mem_barrier, 0, NULL, 0, NULL);
 
+    /* Pipeline barrier: compute write -> transfer read */
+    VkMemoryBarrier transfer_barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &transfer_barrier, 0, NULL, 0, NULL);
+
     /* Copy destination back to staging output buffer */
     VkBufferCopy copy_region = {
         .srcOffset = 0,
@@ -717,6 +834,15 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     };
     vkCmdCopyBuffer(cmd, vk->dst_buf, vk->ref_bufs[0], 1, &ref_copy);
 
+    /* Pipeline barrier: transfer write -> host read */
+    VkMemoryBarrier host_barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_HOST_READ_BIT
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 1, &host_barrier, 0, NULL, 0, NULL);
+
     vkEndCommandBuffer(cmd);
 
     /* Submit asynchronously */
@@ -729,6 +855,7 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     vkResetFences(vk->device, 1, &vk->fence);
     VkResult queue_res = vkQueueSubmit(vk->compute_queue, 1, &submit_info, vk->fence);
     if (queue_res != VK_SUCCESS) {
+        fprintf(stderr, "[compute-vp9] vkQueueSubmit failed: %d\n", queue_res);
         vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
         return CVP9_ERR_GPU;
     }
@@ -744,7 +871,11 @@ cvp9_err_t vulkan_get_frame(void *ctx, cvp9_frame_info_t *info)
     
     /* Synchronize and clean up the active command buffer */
     if (vk->active_cmd != VK_NULL_HANDLE) {
-        vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
+        VkResult fence_res = vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
+        if (fence_res != VK_SUCCESS) {
+            fprintf(stderr, "[compute-vp9] vkWaitForFences in get_frame failed: %d\n", fence_res);
+            return CVP9_ERR_GPU;
+        }
         vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &vk->active_cmd);
         vk->active_cmd = VK_NULL_HANDLE;
     }

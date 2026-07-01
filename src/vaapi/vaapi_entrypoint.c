@@ -33,6 +33,12 @@ typedef struct {
     VASurfaceID        current_render_target;
     uint8_t           *bitstream_buffer;
     size_t             bitstream_size;
+
+    /* VA-API parameters */
+    VADecPictureParameterBufferVP9 pic_param;
+    VASliceParameterBufferVP9     slice_param;
+    bool                           has_pic_param;
+    bool                           has_slice_param;
 } cvp9_driver_data_t;
 
 #define GET_DRIVER(ctx) ((cvp9_driver_data_t *)((ctx)->pDriverData))
@@ -244,6 +250,9 @@ static VAStatus cvp9_BeginPicture(VADriverContextP ctx,
     drv->bitstream_buffer = NULL;
     drv->bitstream_size = 0;
 
+    drv->has_pic_param = false;
+    drv->has_slice_param = false;
+
     return VA_STATUS_SUCCESS;
 }
 
@@ -268,6 +277,16 @@ static VAStatus cvp9_RenderPicture(VADriverContextP ctx,
             memcpy(new_buf + drv->bitstream_size, buf->data, buf->size * buf->num_elements);
             drv->bitstream_buffer = new_buf;
             drv->bitstream_size = new_size;
+        } else if (buf->type == VAPictureParameterBufferType) {
+            if (buf->size >= sizeof(VADecPictureParameterBufferVP9) && buf->data) {
+                memcpy(&drv->pic_param, buf->data, sizeof(VADecPictureParameterBufferVP9));
+                drv->has_pic_param = true;
+            }
+        } else if (buf->type == VASliceParameterBufferType) {
+            if (buf->size >= sizeof(VASliceParameterBufferVP9) && buf->data) {
+                memcpy(&drv->slice_param, buf->data, sizeof(VASliceParameterBufferVP9));
+                drv->has_slice_param = true;
+            }
         }
     }
     return VA_STATUS_SUCCESS;
@@ -280,7 +299,13 @@ static VAStatus cvp9_EndPicture(VADriverContextP ctx, VAContextID ctx_id)
     if (drv->bitstream_size == 0) return VA_STATUS_SUCCESS;
 
     /* Decode frame */
-    cvp9_err_t err = cvp9_decode(drv->decoder, drv->bitstream_buffer, drv->bitstream_size, 0);
+    cvp9_err_t err;
+    if (drv->has_pic_param && drv->has_slice_param) {
+        err = cvp9_decode_vaapi(drv->decoder, drv->bitstream_buffer, drv->bitstream_size, 0,
+                                 &drv->pic_param, &drv->slice_param);
+    } else {
+        err = cvp9_decode(drv->decoder, drv->bitstream_buffer, drv->bitstream_size, 0);
+    }
     if (err != CVP9_OK) {
         fprintf(stderr, "[compute-vp9] VA-API decode failed: %d\n", err);
         return VA_STATUS_ERROR_DECODING_ERROR;
