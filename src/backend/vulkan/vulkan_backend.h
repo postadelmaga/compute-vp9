@@ -67,8 +67,12 @@ typedef struct {
     /* Input buffers */
     VkBuffer         coeff_buf;
     VkDeviceMemory   coeff_mem;
+    size_t           coeff_buf_size;
+    void            *coeff_mapped;
     VkBuffer         mv_buf;
     VkDeviceMemory   mv_mem;
+    size_t           mv_buf_size;
+    void            *mv_mapped;
 
     /* Temporary buffers for neighbor copy */
     VkBuffer         above_buf;
@@ -80,6 +84,7 @@ typedef struct {
     VkBuffer         block_buf;
     VkDeviceMemory   block_mem;
     size_t           block_buf_size;
+    void            *block_mapped;
 
     /* Current frame dimensions */
     uint32_t         width;
