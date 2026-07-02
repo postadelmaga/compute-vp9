@@ -80,7 +80,15 @@ int main(int argc, char **argv)
 
     /* VP9 frame contexts, managed like the decoder does */
     static vp9_entropy_probs_t fctx[4], fprobs;
+    static vp9_counts_t counts;
     for (int i = 0; i < 4; i++) vp9_entropy_probs_init(&fctx[i]);
+
+    /* Previous-frame MV state */
+    int8_t *prev_ref0 = NULL, *prev_ref1 = NULL, *cur_ref0 = NULL, *cur_ref1 = NULL;
+    int16_t *prev_mvs = NULL, *cur_mvs = NULL;
+    size_t mi_alloc = 0;
+    int last_show = 0, last_key = 1, last_intra_only = 0;
+    uint32_t prev_w = 0, prev_h = 0;
 
     for (;;) {
         uint8_t fh[12];
@@ -158,19 +166,32 @@ int main(int argc, char **argv)
                 &hdr, frames[i] + hdr.uncompressed_header_bytes,
                 hdr.first_partition_size, &fprobs);
             CHECK(chdr_rc == 0, "frame %d: compressed header parse failed", frame_no);
-            if (hdr.refresh_frame_context) {
-                fctx[hdr.frame_context_idx & 3] = fprobs;
-            }
 
             /* Conformant entropy decode of every frame's tiles: the bool
              * decoder must consume ~exactly each tile and cover the MI grid.
              * Frames 0-1 are strict (no backward adaptation involved yet);
              * later frames report drift until adaptation is implemented. */
-            int strict = frame_no < 2;
+            int strict = 1;
             if (!hdr.segmentation_enabled && hdr.width > 0) {
                 vp9_parsed_frame_t *tpf = vp9_parsed_frame_alloc(hdr.width, hdr.height);
                 if (tpf) {
                     memcpy(&tpf->hdr, &hdr, sizeof(hdr));
+                    size_t mi_count = (size_t)tpf->mi_grid_width * tpf->mi_grid_height;
+                    if (mi_count > mi_alloc) {
+                        free(prev_ref0); free(prev_ref1); free(prev_mvs);
+                        free(cur_ref0); free(cur_ref1); free(cur_mvs);
+                        prev_ref0 = calloc(mi_count, 1);
+                        prev_ref1 = calloc(mi_count, 1);
+                        prev_mvs = calloc(mi_count * 4, sizeof(int16_t));
+                        cur_ref0 = calloc(mi_count, 1);
+                        cur_ref1 = calloc(mi_count, 1);
+                        cur_mvs = calloc(mi_count * 4, sizeof(int16_t));
+                        mi_alloc = mi_count;
+                    }
+                    int use_prev = !hdr.error_resilient && hdr.width == prev_w &&
+                                   hdr.height == prev_h && !last_intra_only &&
+                                   last_show && !last_key;
+                    memset(&counts, 0, sizeof(counts));
                     int mi_cols = ((int)hdr.width + 7) >> 3;
                     int mi_rows = ((int)hdr.height + 7) >> 3;
                     int sb_cols = (mi_cols + 7) >> 3, sb_rows = (mi_rows + 7) >> 3;
@@ -203,8 +224,10 @@ int main(int argc, char **argv)
                                 rc_all = -1;
                                 break;
                             }
-                            int trc = vp9_decode_tile_kf(&rd, r0, r1, c0, c1,
-                                                         &fprobs, tpf);
+                            int trc = vp9_decode_tile_conformant(&rd, r0, r1, c0, c1,
+                                    &fprobs, tpf, &counts,
+                                    prev_ref0, prev_ref1, prev_mvs, use_prev,
+                                    cur_ref0, cur_ref1, cur_mvs);
                             size_t consumed =
                                 (size_t)(vpx_reader_find_end(&rd) - (frames[i] + off));
                             if (strict) {
@@ -221,6 +244,27 @@ int main(int argc, char **argv)
                             off += tsize;
                         }
                     }
+
+                    /* Backward adaptation, then context refresh (libvpx order) */
+                    if (!rc_all && !hdr.error_resilient && !hdr.frame_parallel) {
+                        int intra_only_f = hdr.frame_type == VP9_FRAME_KEY || hdr.intra_only;
+                        vp9_adapt_probs(&fprobs, &fctx[hdr.frame_context_idx & 3],
+                                        &counts, intra_only_f, last_key,
+                                        hdr.allow_high_precision_mv,
+                                        hdr.interp_filter == VP9_FILTER_SWITCHABLE);
+                    }
+                    if (hdr.refresh_frame_context) {
+                        fctx[hdr.frame_context_idx & 3] = fprobs;
+                    }
+
+                    /* Swap prev-frame MV state */
+                    { int8_t *t0 = prev_ref0; prev_ref0 = cur_ref0; cur_ref0 = t0; }
+                    { int8_t *t1 = prev_ref1; prev_ref1 = cur_ref1; cur_ref1 = t1; }
+                    { int16_t *tm = prev_mvs; prev_mvs = cur_mvs; cur_mvs = tm; }
+                    prev_w = hdr.width; prev_h = hdr.height;
+                    last_show = hdr.show_frame;
+                    last_key = hdr.frame_type == VP9_FRAME_KEY;
+                    last_intra_only = hdr.intra_only;
 
                     if (!rc_all) {
                         uint32_t covered = 0;

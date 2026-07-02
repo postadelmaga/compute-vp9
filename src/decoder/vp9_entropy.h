@@ -157,4 +157,50 @@ int vp9_parse_compressed_header(const vp9_frame_header_t *hdr,
                                 const uint8_t *data, size_t size,
                                 vp9_entropy_probs_t *fc);
 
+/* ── Symbol counts + backward adaptation (spec §9 / libvpx) ─────────────── */
+
+typedef struct {
+    unsigned int coef[TX_SIZES][PLANE_TYPES][REF_TYPES][COEF_BANDS][COEFF_CONTEXTS][4];
+    unsigned int eob_branch[TX_SIZES][PLANE_TYPES][REF_TYPES][COEF_BANDS][COEFF_CONTEXTS];
+    unsigned int skip[3][2];
+    unsigned int intra_inter[4][2];
+    unsigned int tx8[2][2];
+    unsigned int tx16[2][3];
+    unsigned int tx32[2][4];
+    unsigned int y_mode[4][10];
+    unsigned int uv_mode[10][10];
+    unsigned int partition[16][4];
+    unsigned int inter_mode[7][4];
+    unsigned int switchable_interp[4][3];
+    unsigned int single_ref[5][2][2];
+    unsigned int comp_inter[5][2];
+    unsigned int comp_ref[5][2];
+    unsigned int mv_joints[4];
+    struct {
+        unsigned int sign[2];
+        unsigned int classes[11];
+        unsigned int class0[2];
+        unsigned int bits[10][2];
+        unsigned int class0_fp[2][4];
+        unsigned int fp[4];
+        unsigned int class0_hp[2];
+        unsigned int hp[2];
+    } mv_comp[2];
+} vp9_counts_t;
+
+/* Accumulate b into a (all fields are additive) */
+void vp9_counts_accumulate(vp9_counts_t *a, const vp9_counts_t *b);
+
+/**
+ * Backward probability adaptation after a frame decode: merges the
+ * PRE-frame context (`pre_fc`, the saved frame context the frame started
+ * from) with the frame's symbol counts into `fc` (libvpx semantics —
+ * adaptation overrides the forward header updates).
+ * `intra_only`: frame was KEY/intra (adapts coef probs only).
+ * `last_was_key`: previous frame was a keyframe (raises coef update factor).
+ */
+void vp9_adapt_probs(vp9_entropy_probs_t *fc, const vp9_entropy_probs_t *pre_fc,
+                     const vp9_counts_t *counts, int intra_only,
+                     int last_was_key, int allow_hp, int interp_switchable);
+
 

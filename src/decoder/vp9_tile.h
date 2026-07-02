@@ -27,7 +27,23 @@ int vp9_decode_tiles(const vp9_frame_header_t *hdr,
                      vp9_parsed_frame_t *pf);
 
 /**
- * Decodes a single keyframe tile on the spec-conformant path (vp9_kf_tile.c).
+ * Spec-conformant tile decode, key and inter frames (vp9_kf_tile.c).
+ * counts (nullable): symbol counts for backward adaptation.
+ * prev_*: previous frame per-mi refs/MVs for the MV candidate scan.
+ * out_*: per-mi refs/MVs of this frame (for the next frame's scan).
+ */
+int vp9_decode_tile_conformant(vpx_reader *r,
+                               int mi_row_start, int mi_row_end,
+                               int mi_col_start, int mi_col_end,
+                               const vp9_entropy_probs_t *probs,
+                               vp9_parsed_frame_t *pf,
+                               vp9_counts_t *counts,
+                               const int8_t *prev_ref0, const int8_t *prev_ref1,
+                               const int16_t *prev_mv, int use_prev_mvs,
+                               int8_t *out_ref0, int8_t *out_ref1, int16_t *out_mv);
+
+/**
+ * Convenience wrapper: conformant decode without counts/prev-MV state.
  */
 int vp9_decode_tile_kf(vpx_reader *r,
                        int mi_row_start, int mi_row_end,

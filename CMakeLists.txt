@@ -61,6 +61,7 @@ add_library(compute_vp9 SHARED
     src/decoder/vp9_compressed_hdr.c
     src/decoder/vp9_tile.c
     src/decoder/vp9_kf_tile.c
+    src/decoder/vp9_adapt.c
     src/decoder/vp9_frame.c
     src/decoder/vp9_parsed_frame.c
     src/decoder/vp9_reconstruct.c

@@ -59,6 +59,20 @@ typedef struct {
     int8_t   comp_var_ref[2];
     int      sign_bias[4];   /* indexed by ref frame 0..3 */
 
+    /* Symbol counts for backward adaptation (nullable) */
+    vp9_counts_t *counts;
+
+    /* Previous frame MVs (nullable): per-mi ref pair + mv pair */
+    const int8_t  *prev_ref0;
+    const int8_t  *prev_ref1;
+    const int16_t *prev_mv;   /* [mi][2 refs][2] row,col */
+    int            use_prev_mvs;
+
+    /* Per-mi export for the next frame's prev-MV scan (nullable) */
+    int8_t  *out_ref0;
+    int8_t  *out_ref1;
+    int16_t *out_mv;
+
     uint8_t token_cache[1024];
 } kf_tile_ctx_t;
 
@@ -119,7 +133,9 @@ static int read_skip(kf_tile_ctx_t *t, int mi_row, int mi_col)
         ctx += t->mi_skip[(mi_row - 1) * t->mi_cols + mi_col];
     if (mi_col > t->tile_col_start)
         ctx += t->mi_skip[mi_row * t->mi_cols + (mi_col - 1)];
-    return vpx_read(t->r, t->fc->skip_probs[ctx]);
+    int v = vpx_read(t->r, t->fc->skip_probs[ctx]);
+    if (t->counts) t->counts->skip[ctx][v]++;
+    return v;
 }
 
 static int read_tx_size(kf_tile_ctx_t *t, int mi_row, int mi_col, int bsize, int allow_select)
@@ -157,6 +173,11 @@ static int read_tx_size(kf_tile_ctx_t *t, int mi_row, int mi_col, int bsize, int
     if (tx_size != 0 && max_tx >= 2) {
         tx_size += vpx_read(t->r, p[1]);
         if (tx_size != 1 && max_tx >= 3) tx_size += vpx_read(t->r, p[2]);
+    }
+    if (t->counts) {
+        if (max_tx == 1) t->counts->tx8[ctx][tx_size]++;
+        else if (max_tx == 2) t->counts->tx16[ctx][tx_size]++;
+        else t->counts->tx32[ctx][tx_size]++;
     }
     return tx_size;
 }
@@ -211,14 +232,19 @@ static int decode_coefs(kf_tile_ctx_t *t, int plane_type, int tx_size, int tx_ty
     int c = 0;
     int ctx = ctx_in;
 
+    vp9_counts_t *cnt = t->counts;
+#define INC_COEF(tok) do { if (cnt) cnt->coef[tx_size][plane_type][ref_type][band][ctx][tok]++; } while (0)
+
     while (c < max_eob) {
         int band = band_translate[c];
         const uint8_t *prob = coef_probs[band][ctx];
         int val;
 
-        if (!vpx_read(r, prob[0])) break;  /* EOB */
+        if (cnt) cnt->eob_branch[tx_size][plane_type][ref_type][band][ctx]++;
+        if (!vpx_read(r, prob[0])) { INC_COEF(3); break; }  /* EOB */
 
         while (!vpx_read(r, prob[1])) {    /* ZERO run */
+            INC_COEF(0);
             token_cache[scan[c]] = 0;
             c++;
             if (c >= max_eob) return c;
@@ -228,9 +254,11 @@ static int decode_coefs(kf_tile_ctx_t *t, int plane_type, int tx_size, int tx_ty
         }
 
         if (!vpx_read(r, prob[2])) {
+            INC_COEF(1);
             token_cache[scan[c]] = 1;      /* energy class of ONE */
             val = 1;
         } else {
+            INC_COEF(2);
             const uint8_t *p = vp9_pareto8_full[prob[2] - 1];
             if (!vpx_read(r, p[0])) {
                 if (!vpx_read(r, p[1])) {
@@ -273,6 +301,7 @@ static int decode_coefs(kf_tile_ctx_t *t, int plane_type, int tx_size, int tx_ty
             ctx = (1 + token_cache[nb[2 * c]] + token_cache[nb[2 * c + 1]]) >> 1;
         }
     }
+#undef INC_COEF
 
     return c;
 }
@@ -491,7 +520,16 @@ static int dec_find_mv_refs_(const kf_tile_ctx_t *t, int mode, int ref_frame,
         }
     }
 
-    /* prev-frame MVs: not wired yet (frame after keyframe never uses them) */
+    if (t->use_prev_mvs) {
+        int pmi = mi_row * t->mi_cols + mi_col;
+        if (t->prev_ref0[pmi] == ref_frame) {
+            mv_t m = { t->prev_mv[pmi * 4 + 0], t->prev_mv[pmi * 4 + 1] };
+            ADD_CAND(m);
+        } else if (t->prev_ref1[pmi] == ref_frame) {
+            mv_t m = { t->prev_mv[pmi * 4 + 2], t->prev_mv[pmi * 4 + 3] };
+            ADD_CAND(m);
+        }
+    }
 
     if (different_ref_found) {
         for (i = 0; i < 8; i++) {
@@ -503,6 +541,27 @@ static int dec_find_mv_refs_(const kf_tile_ctx_t *t, int mode, int ref_frame,
                     !mv_equal(mi_get_mv(t, mi, 1), mi_get_mv(t, mi, 0)))
                     ADD_CAND(scale_mv_(t, mi, 1, ref_frame));
             }
+        }
+    }
+    if (t->use_prev_mvs) {
+        int pmi = mi_row * t->mi_cols + mi_col;
+        if (t->prev_ref0[pmi] != ref_frame && t->prev_ref0[pmi] > INTRA_FRAME_) {
+            mv_t m = { t->prev_mv[pmi * 4 + 0], t->prev_mv[pmi * 4 + 1] };
+            if (t->sign_bias[t->prev_ref0[pmi] & 3] != t->sign_bias[ref_frame]) {
+                m.row = (int16_t)-m.row;
+                m.col = (int16_t)-m.col;
+            }
+            ADD_CAND(m);
+        }
+        if (t->prev_ref1[pmi] > INTRA_FRAME_ && t->prev_ref1[pmi] != ref_frame &&
+            !(t->prev_mv[pmi * 4 + 2] == t->prev_mv[pmi * 4 + 0] &&
+              t->prev_mv[pmi * 4 + 3] == t->prev_mv[pmi * 4 + 1])) {
+            mv_t m = { t->prev_mv[pmi * 4 + 2], t->prev_mv[pmi * 4 + 3] };
+            if (t->sign_bias[t->prev_ref1[pmi] & 3] != t->sign_bias[ref_frame]) {
+                m.row = (int16_t)-m.row;
+                m.col = (int16_t)-m.col;
+            }
+            ADD_CAND(m);
         }
     }
 #undef ADD_CAND
@@ -560,6 +619,38 @@ static int read_mv_component_(kf_tile_ctx_t *t, int comp, int usehp)
     return sign ? -mag : mag;
 }
 
+static int get_mv_class_(int z, int *offset)
+{
+    int c = 10;
+    for (int i = 0; i < 10; i++) {
+        if (z < (2 << (i + 3))) { c = i; break; }  /* base(i+1) = 2 << (i+3) */
+    }
+    if (offset) *offset = z - (c ? 2 << (c + 2) : 0);
+    return c;
+}
+
+static void inc_mv_component_(vp9_counts_t *cnt, int comp, int v)
+{
+    int s = v < 0;
+    cnt->mv_comp[comp].sign[s]++;
+    int z = (s ? -v : v) - 1;
+    int o;
+    int c = get_mv_class_(z, &o);
+    cnt->mv_comp[comp].classes[c]++;
+    int d = o >> 3, f = (o >> 1) & 3, e = o & 1;
+    if (c == 0) {
+        cnt->mv_comp[comp].class0[d]++;
+        cnt->mv_comp[comp].class0_fp[d][f]++;
+        cnt->mv_comp[comp].class0_hp[e]++;
+    } else {
+        int b = c + 2;  /* CLASS0_BITS - 1 + c... bits count for counting */
+        for (int i = 0; i < b; i++)
+            cnt->mv_comp[comp].bits[i][(d >> i) & 1]++;
+        cnt->mv_comp[comp].fp[f]++;
+        cnt->mv_comp[comp].hp[e]++;
+    }
+}
+
 static void read_mv_(kf_tile_ctx_t *t, mv_t *mv, const mv_t *ref)
 {
     int joint = read_tree(t->r, vp9_mv_joint_tree_tbl, t->fc->mv_joint_probs);
@@ -570,6 +661,13 @@ static void read_mv_(kf_tile_ctx_t *t, mv_t *mv, const mv_t *ref)
         diff.row = (int16_t)read_mv_component_(t, 0, use_hp);
     if (joint == 1 || joint == 3)  /* horizontal nonzero */
         diff.col = (int16_t)read_mv_component_(t, 1, use_hp);
+
+    if (t->counts) {
+        int j = (diff.col != 0) | ((diff.row != 0) << 1);
+        t->counts->mv_joints[j]++;
+        if (diff.row != 0) inc_mv_component_(t->counts, 0, diff.row);
+        if (diff.col != 0) inc_mv_component_(t->counts, 1, diff.col);
+    }
 
     mv->row = (int16_t)(ref->row + diff.row);
     mv->col = (int16_t)(ref->col + diff.col);
@@ -780,6 +878,7 @@ static void read_ref_frames_(kf_tile_ctx_t *t, int mi_row, int mi_col, int8_t re
             ctx = 1;
         }
         mode = vpx_read(r, t->fc->comp_inter_probs[ctx]);  /* 0=single 1=compound */
+        if (t->counts) t->counts->comp_inter[ctx][mode]++;
     }
 
     if (mode == VP9_COMPOUND_REFERENCE) {
@@ -798,14 +897,17 @@ static void read_ref_frames_(kf_tile_ctx_t *t, int mi_row, int mi_col, int8_t re
             }
         }
         int bit = vpx_read(r, t->fc->comp_ref_probs[ctx]);
+        if (t->counts) t->counts->comp_ref[ctx][bit]++;
         ref[idx] = t->comp_fixed_ref;
         ref[!idx] = t->comp_var_ref[bit];
     } else {
         int ctx0 = get_single_ref_p1_ctx(t, a, l);
         int bit0 = vpx_read(r, t->fc->single_ref_probs[ctx0][0]);
+        if (t->counts) t->counts->single_ref[ctx0][0][bit0]++;
         if (bit0) {
             int ctx1 = get_single_ref_p2_ctx(t, a, l);
             int bit1 = vpx_read(r, t->fc->single_ref_probs[ctx1][1]);
+            if (t->counts) t->counts->single_ref[ctx1][1][bit1]++;
             ref[0] = bit1 ? ALTREF_FRAME_ : GOLDEN_FRAME_;
         } else {
             ref[0] = LAST_FRAME_;
@@ -921,33 +1023,41 @@ static int decode_block_kf(kf_tile_ctx_t *t, int mi_row, int mi_col, int bsize)
         get_neighbor_mis(t, mi_row, mi_col, &a, &l);
 
         skip = read_skip(t, mi_row, mi_col);
-        int is_inter = vpx_read(r, fc->intra_inter_probs[get_intra_inter_ctx(t, a, l)]);
+        int ii_ctx = get_intra_inter_ctx(t, a, l);
+        int is_inter = vpx_read(r, fc->intra_inter_probs[ii_ctx]);
+        if (t->counts) t->counts->intra_inter[ii_ctx][is_inter]++;
         y_tx = read_tx_size(t, mi_row, mi_col, bsize, !skip || !is_inter);
 
         if (!is_inter) {
             /* Intra block in an inter frame (if_y/if_uv probability sets) */
+#define READ_Y_MODE(grp) ({ \
+        int m_ = vp9_read_intra_mode(r, fc->y_mode_probs[grp]); \
+        if (t->counts) t->counts->y_mode[grp][m_]++; \
+        m_; })
             switch (bsize) {
             case 0:
                 for (int i = 0; i < 4; i++)
-                    bmi[i] = (uint8_t)vp9_read_intra_mode(r, fc->y_mode_probs[0]);
+                    bmi[i] = (uint8_t)READ_Y_MODE(0);
                 mode = bmi[3];
                 break;
             case 1:
-                bmi[0] = bmi[2] = (uint8_t)vp9_read_intra_mode(r, fc->y_mode_probs[0]);
-                bmi[1] = bmi[3] = (uint8_t)vp9_read_intra_mode(r, fc->y_mode_probs[0]);
+                bmi[0] = bmi[2] = (uint8_t)READ_Y_MODE(0);
+                bmi[1] = bmi[3] = (uint8_t)READ_Y_MODE(0);
                 mode = bmi[3];
                 break;
             case 2:
-                bmi[0] = bmi[1] = (uint8_t)vp9_read_intra_mode(r, fc->y_mode_probs[0]);
-                bmi[2] = bmi[3] = (uint8_t)vp9_read_intra_mode(r, fc->y_mode_probs[0]);
+                bmi[0] = bmi[1] = (uint8_t)READ_Y_MODE(0);
+                bmi[2] = bmi[3] = (uint8_t)READ_Y_MODE(0);
                 mode = bmi[3];
                 break;
             default:
-                mode = vp9_read_intra_mode(r, fc->y_mode_probs[vp9_size_group[bsize]]);
+                mode = READ_Y_MODE(vp9_size_group[bsize]);
                 bmi[0] = bmi[1] = bmi[2] = bmi[3] = (uint8_t)mode;
                 break;
             }
+#undef READ_Y_MODE
             uv_mode = vp9_read_intra_mode(r, fc->uv_mode_probs[mode]);
+            if (t->counts) t->counts->uv_mode[mode][uv_mode]++;
         } else {
             read_ref_frames_(t, mi_row, mi_col, ref);
             int is_compound = ref[1] > 0;
@@ -958,14 +1068,20 @@ static int decode_block_kf(kf_tile_ctx_t *t, int mi_row, int mi_col, int bsize)
             mv_t best_ref[2] = { {0, 0}, {0, 0} };
 
             mode = ZEROMV;
-            if (bsize >= BLOCK_8X8_)
+            if (bsize >= BLOCK_8X8_) {
                 mode = NEARESTMV + read_tree(r, vp9_inter_mode_tree_tbl,
                                              fc->inter_mode_probs[mode_ctx]);
+                if (t->counts) t->counts->inter_mode[mode_ctx][mode - NEARESTMV]++;
+            }
 
-            filter = (t->hdr->interp_filter == VP9_FILTER_SWITCHABLE)
-                ? (uint8_t)read_tree(r, vp9_switchable_interp_tree_tbl,
-                      fc->switchable_interp_probs[get_switchable_interp_ctx(t, a, l)])
-                : (uint8_t)t->hdr->interp_filter;
+            if (t->hdr->interp_filter == VP9_FILTER_SWITCHABLE) {
+                int f_ctx = get_switchable_interp_ctx(t, a, l);
+                filter = (uint8_t)read_tree(r, vp9_switchable_interp_tree_tbl,
+                                            fc->switchable_interp_probs[f_ctx]);
+                if (t->counts) t->counts->switchable_interp[f_ctx][filter]++;
+            } else {
+                filter = (uint8_t)t->hdr->interp_filter;
+            }
 
             if (bsize < BLOCK_8X8_) {
                 int n4w = vp9_num_4x4_w[bsize], n4h = vp9_num_4x4_h[bsize];
@@ -980,6 +1096,7 @@ static int decode_block_kf(kf_tile_ctx_t *t, int mi_row, int mi_col, int bsize)
                         int j = idy * 2 + idx;
                         b_mode = NEARESTMV + read_tree(r, vp9_inter_mode_tree_tbl,
                                                        fc->inter_mode_probs[mode_ctx]);
+                        if (t->counts) t->counts->inter_mode[mode_ctx][b_mode - NEARESTMV]++;
 
                         if (b_mode == NEARESTMV || b_mode == NEARMV) {
                             for (int ri = 0; ri < 1 + is_compound; ri++)
@@ -1079,6 +1196,14 @@ static int decode_block_kf(kf_tile_ctx_t *t, int mi_row, int mi_col, int bsize)
             t->mi_ref0[mi] = ref[0];
             t->mi_ref1[mi] = ref[1];
             t->mi_filter[mi] = filter;
+            if (t->out_ref0) {
+                t->out_ref0[mi] = ref[0];
+                t->out_ref1[mi] = ref[1];
+                t->out_mv[mi * 4 + 0] = mv[0].row;
+                t->out_mv[mi * 4 + 1] = mv[0].col;
+                t->out_mv[mi * 4 + 2] = mv[1].row;
+                t->out_mv[mi * 4 + 3] = mv[1].col;
+            }
             t->mi_mv[mi * 4 + 0] = mv[0].row;
             t->mi_mv[mi * 4 + 1] = mv[0].col;
             t->mi_mv[mi * 4 + 2] = mv[1].row;
@@ -1124,17 +1249,21 @@ static int read_partition_kf(kf_tile_ctx_t *t, int mi_row, int mi_col,
     int ctx = (left * 2 + above) + bsl * 4;
     const uint8_t *probs = t->is_kf ? vp9_kf_partition_probs_tbl[ctx]
                                     : t->fc->partition_probs[ctx];
+    int p;
 
     if (has_rows && has_cols) {
-        if (!vpx_read(t->r, probs[0])) return PARTITION_NONE_;
-        if (!vpx_read(t->r, probs[1])) return PARTITION_HORZ_;
-        return vpx_read(t->r, probs[2]) ? PARTITION_SPLIT_ : PARTITION_VERT_;
+        if (!vpx_read(t->r, probs[0])) p = PARTITION_NONE_;
+        else if (!vpx_read(t->r, probs[1])) p = PARTITION_HORZ_;
+        else p = vpx_read(t->r, probs[2]) ? PARTITION_SPLIT_ : PARTITION_VERT_;
+    } else if (!has_rows && has_cols) {
+        p = vpx_read(t->r, probs[1]) ? PARTITION_SPLIT_ : PARTITION_HORZ_;
+    } else if (has_rows && !has_cols) {
+        p = vpx_read(t->r, probs[2]) ? PARTITION_SPLIT_ : PARTITION_VERT_;
+    } else {
+        p = PARTITION_SPLIT_;
     }
-    if (!has_rows && has_cols)
-        return vpx_read(t->r, probs[1]) ? PARTITION_SPLIT_ : PARTITION_HORZ_;
-    if (has_rows && !has_cols)
-        return vpx_read(t->r, probs[2]) ? PARTITION_SPLIT_ : PARTITION_VERT_;
-    return PARTITION_SPLIT_;
+    if (t->counts) t->counts->partition[ctx][p]++;
+    return p;
 }
 
 static int decode_partition_kf(kf_tile_ctx_t *t, int mi_row, int mi_col,
@@ -1188,13 +1317,25 @@ static int decode_partition_kf(kf_tile_ctx_t *t, int mi_row, int mi_col,
 
 /* ── Tile entry point ───────────────────────────────────────────────────── */
 
-int vp9_decode_tile_kf(vpx_reader *r,
-                       int mi_row_start, int mi_row_end,
-                       int mi_col_start, int mi_col_end,
-                       const vp9_entropy_probs_t *probs,
-                       vp9_parsed_frame_t *pf)
+int vp9_decode_tile_conformant(vpx_reader *r,
+                               int mi_row_start, int mi_row_end,
+                               int mi_col_start, int mi_col_end,
+                               const vp9_entropy_probs_t *probs,
+                               vp9_parsed_frame_t *pf,
+                               vp9_counts_t *counts,
+                               const int8_t *prev_ref0, const int8_t *prev_ref1,
+                               const int16_t *prev_mv, int use_prev_mvs,
+                               int8_t *out_ref0, int8_t *out_ref1, int16_t *out_mv)
 {
     kf_tile_ctx_t t = {0};
+    t.counts = counts;
+    t.prev_ref0 = prev_ref0;
+    t.prev_ref1 = prev_ref1;
+    t.prev_mv = prev_mv;
+    t.use_prev_mvs = use_prev_mvs && prev_ref0 && prev_mv;
+    t.out_ref0 = out_ref0;
+    t.out_ref1 = out_ref1;
+    t.out_mv = out_mv;
     t.hdr = &pf->hdr;
     t.fc = probs;
     t.pf = pf;
@@ -1274,4 +1415,16 @@ int vp9_decode_tile_kf(vpx_reader *r,
     free(t.mi_bmi_mv);
     free(t.mi_filter);
     return rc;
+}
+
+int vp9_decode_tile_kf(vpx_reader *r,
+                       int mi_row_start, int mi_row_end,
+                       int mi_col_start, int mi_col_end,
+                       const vp9_entropy_probs_t *probs,
+                       vp9_parsed_frame_t *pf)
+{
+    return vp9_decode_tile_conformant(r, mi_row_start, mi_row_end,
+                                      mi_col_start, mi_col_end, probs, pf,
+                                      NULL, NULL, NULL, NULL, 0,
+                                      NULL, NULL, NULL);
 }
