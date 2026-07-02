@@ -183,7 +183,7 @@ int test_keyframe_decode(void)
     if (err != CVP9_OK) FAIL("cvp9_decode", cvp9_err_str(err));
 
     cvp9_frame_info_t frame;
-    err = cvp9_get_frame(ctx, &frame);
+    err = cvp9_get_frame_sync(ctx, &frame);
     if (err != CVP9_OK) FAIL("cvp9_get_frame", cvp9_err_str(err));
 
     printf("  decoded frame width=%u, height=%u, pts=%ld\n",
@@ -234,7 +234,7 @@ int test_keyframe_decode_vulkan(void)
     if (err != CVP9_OK) FAIL("cvp9_decode", cvp9_err_str(err));
 
     cvp9_frame_info_t frame;
-    err = cvp9_get_frame(ctx, &frame);
+    err = cvp9_get_frame_sync(ctx, &frame);
     if (err != CVP9_OK) FAIL("cvp9_get_frame", cvp9_err_str(err));
 
     printf("  decoded frame width=%u, height=%u, pts=%ld\n",

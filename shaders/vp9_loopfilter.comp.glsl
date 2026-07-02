@@ -4,13 +4,15 @@
  * Applies VP9's adaptive deblocking filter along horizontal
  * and vertical block boundaries.
  *
- * One workgroup per 8-pixel boundary segment.
+ * 2D dispatch: X covers the pixel position along the boundary, Y selects
+ * which 8-pixel boundary is filtered — one thread per (pixel, boundary)
+ * pair, so the whole frame is filtered in a single well-occupied dispatch.
  */
 #version 450
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, std430) buffer Frame {
     uint8_t pixels[];
@@ -57,34 +59,31 @@ void filter4(uint p1_off, uint p0_off, uint q0_off, uint q1_off, uint threshold)
 
 void main()
 {
-    uint tid = gl_GlobalInvocationID.x;
     uint threshold = limit_from_level(pc.filter_level, pc.sharpness);
 
     if (pc.pass == 0u) {
         /* Horizontal pass — filter along horizontal boundaries */
-        uint x = tid;
-        if (x >= pc.frame_width) return;
-        for (uint y = 8u; y < pc.frame_height; y += 8u) {
-            filter4(
-                (y - 2u) * pc.stride + x,
-                (y - 1u) * pc.stride + x,
-                (y + 0u) * pc.stride + x,
-                (y + 1u) * pc.stride + x,
-                threshold
-            );
-        }
+        uint x = gl_GlobalInvocationID.x;
+        uint y = (gl_GlobalInvocationID.y + 1u) * 8u;
+        if (x >= pc.frame_width || y >= pc.frame_height) return;
+        filter4(
+            (y - 2u) * pc.stride + x,
+            (y - 1u) * pc.stride + x,
+            (y + 0u) * pc.stride + x,
+            (y + 1u) * pc.stride + x,
+            threshold
+        );
     } else {
         /* Vertical pass — filter along vertical boundaries */
-        uint y = tid;
-        if (y >= pc.frame_height) return;
-        for (uint x = 8u; x < pc.frame_width; x += 8u) {
-            filter4(
-                y * pc.stride + x - 2u,
-                y * pc.stride + x - 1u,
-                y * pc.stride + x + 0u,
-                y * pc.stride + x + 1u,
-                threshold
-            );
-        }
+        uint y = gl_GlobalInvocationID.x;
+        uint x = (gl_GlobalInvocationID.y + 1u) * 8u;
+        if (y >= pc.frame_height || x >= pc.frame_width) return;
+        filter4(
+            y * pc.stride + x - 2u,
+            y * pc.stride + x - 1u,
+            y * pc.stride + x + 0u,
+            y * pc.stride + x + 1u,
+            threshold
+        );
     }
 }

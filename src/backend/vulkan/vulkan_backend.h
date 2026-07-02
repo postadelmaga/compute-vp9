@@ -33,12 +33,57 @@ typedef struct {
     uint32_t pad3;
 } gpu_block_data_t;
 
+/* Number of frames that may be in flight on the GPU simultaneously.
+ * The CPU entropy decode of frame N+1..N+2 overlaps GPU reconstruction of
+ * frame N; delivery latency is at most CVP9_INFLIGHT-1 frames. */
+#define CVP9_INFLIGHT 3
+
+/* Per in-flight-frame resources: everything the CPU touches while the GPU
+ * may still be working on another frame must be per-slot. */
+typedef struct {
+    VkCommandBuffer  cmd;        /* persistent, implicitly reset on begin */
+    VkFence          fence;
+    int              pending;    /* submitted, not yet delivered */
+    int64_t          pts;
+
+    /* Host-visible output (I420), persistently mapped, optionally
+     * exported as DMA-BUF for zero-copy cross-GPU consumption */
+    VkBuffer         output_buf;
+    VkDeviceMemory   output_mem;
+    void            *output_mapped;
+    int              dmabuf_fd;  /* -1 when export unavailable */
+
+    /* Upload staging (host-visible, persistently mapped, grow-only) */
+    VkBuffer         coeff_buf;
+    VkDeviceMemory   coeff_mem;
+    size_t           coeff_cap;
+    void            *coeff_mapped;
+    VkBuffer         mv_buf;
+    VkDeviceMemory   mv_mem;
+    size_t           mv_cap;
+    void            *mv_mapped;
+    VkBuffer         block_buf;
+    VkDeviceMemory   block_mem;
+    size_t           block_cap;
+    void            *block_mapped;
+
+    /* Descriptor sets bound to this slot's buffers */
+    VkDescriptorSet  desc_mc;
+    VkDescriptorSet  desc_intra;
+    VkDescriptorSet  desc_idct;
+    VkDescriptorSet  desc_lf;
+} vk_frame_slot_t;
+
 typedef struct {
     VkInstance       instance;
     VkPhysicalDevice phys_device;
     VkDevice         device;
     VkQueue          compute_queue;
     uint32_t         compute_family;
+
+    /* External memory (DMA-BUF) export support */
+    int              ext_dmabuf;
+    PFN_vkGetMemoryFdKHR pfn_get_memory_fd;
 
     /* Pipelines */
     VkPipeline       pipe_idct;
@@ -49,59 +94,37 @@ typedef struct {
     VkDescriptorPool desc_pool;
     VkDescriptorSetLayout desc_layout_mc;
     VkDescriptorSetLayout desc_layout_buffer;
-    VkDescriptorSet  desc_mc;
-    VkDescriptorSet  desc_intra;
-    VkDescriptorSet  desc_idct;
-    VkDescriptorSet  desc_lf;
 
-    /* Frame buffers (YUV format) */
+    /* Frame buffers (YUV format), shared across slots — GPU work is
+     * serialized on a single queue so cross-frame hazards are handled with
+     * barriers at command-buffer boundaries */
     VkImage          ref_images[8];
     VkDeviceMemory   ref_image_mems[8];
     VkImageView      ref_views[8];
     VkSampler        ref_sampler;
-    
+
     VkBuffer         dst_buf;
     VkDeviceMemory   dst_mem;
     size_t           dst_size;
-    
-    /* Input buffers */
-    VkBuffer         coeff_buf;
-    VkDeviceMemory   coeff_mem;
-    size_t           coeff_buf_size;
-    void            *coeff_mapped;
-    VkBuffer         mv_buf;
-    VkDeviceMemory   mv_mem;
-    size_t           mv_buf_size;
-    void            *mv_mapped;
 
     /* Temporary buffers for neighbor copy */
     VkBuffer         above_buf;
     VkDeviceMemory   above_mem;
     VkBuffer         left_buf;
     VkDeviceMemory   left_mem;
-    
-    /* Batch block data buffer */
-    VkBuffer         block_buf;
-    VkDeviceMemory   block_mem;
-    size_t           block_buf_size;
-    void            *block_mapped;
 
     /* Current frame dimensions */
     uint32_t         width;
     uint32_t         height;
-    int64_t          pts;
-    int              has_frame;
-
-    /* Output buffer (host-visible) */
-    VkBuffer         output_buf;
-    VkDeviceMemory   output_mem;
     size_t           output_size;
-    void            *output_mapped;
+
+    /* In-flight frame ring */
+    vk_frame_slot_t  slots[CVP9_INFLIGHT];
+    uint32_t         ring_head;   /* oldest pending slot */
+    uint32_t         ring_count;  /* number of pending slots */
 
     /* Command infrastructure */
     VkCommandPool    cmd_pool;
-    VkCommandBuffer  active_cmd;
-    VkFence          fence;
 } vulkan_ctx_t;
 
 cvp9_err_t vulkan_backend_init(void **ctx);
@@ -113,6 +136,14 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
                                 const vp9_parsed_frame_t *pf,
                                 int64_t pts);
 
-cvp9_err_t vulkan_get_frame(void *ctx, cvp9_frame_info_t *info);
+/* wait=0: returns CVP9_ERR_AGAIN if the oldest frame is still on the GPU
+ * (unless the pipeline is full, in which case it blocks to guarantee
+ * progress). wait=1: always blocks until the oldest frame is done. */
+cvp9_err_t vulkan_get_frame(void *ctx, cvp9_frame_info_t *info, int wait);
+
+cvp9_err_t vulkan_get_frame_dmabuf(void *ctx, cvp9_dmabuf_frame_t *out);
+
+cvp9_err_t vulkan_export_buffer_alloc(void *ctx, uint64_t size, cvp9_export_buffer_t *out);
+void       vulkan_export_buffer_free(void *ctx, cvp9_export_buffer_t *buf);
 
 #endif /* ENABLE_VULKAN */

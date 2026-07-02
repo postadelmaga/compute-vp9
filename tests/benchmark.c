@@ -277,6 +277,10 @@ int main(int argc, char **argv)
     double vk_max_frame_ms = 0;
     int vk_frame_drops_60fps = 0;
 
+    /* Note: the Vulkan backend pipelines up to a few frames in flight —
+     * cvp9_get_frame returns CVP9_ERR_AGAIN while the oldest frame is still
+     * on the GPU, so we count delivered frames and drain the pipeline with
+     * cvp9_get_frame_sync at the end. */
     if (duration_sec > 0) {
         double dur_ms = duration_sec * 1000.0;
         while ((get_time_ms() - vk_start) < dur_ms) {
@@ -293,7 +297,7 @@ int main(int argc, char **argv)
                 cvp9_err_t get_err = cvp9_get_frame(vk_ctx, &out_frame);
                 if (get_err == CVP9_OK) {
                     vk_decoded_count++;
-                } else {
+                } else if (get_err != CVP9_ERR_AGAIN) {
                     printf("[benchmark] cvp9_get_frame failed at frame %d: %s\n", f, cvp9_err_str(get_err));
                 }
             } else {
@@ -320,7 +324,7 @@ int main(int argc, char **argv)
                 cvp9_err_t get_err = cvp9_get_frame(vk_ctx, &out_frame);
                 if (get_err == CVP9_OK) {
                     vk_decoded_count++;
-                } else {
+                } else if (get_err != CVP9_ERR_AGAIN) {
                     printf("[benchmark] cvp9_get_frame failed at frame %d: %s\n", f, cvp9_err_str(get_err));
                 }
             } else {
@@ -330,6 +334,14 @@ int main(int argc, char **argv)
             double f_time = frame_end_time - frame_start_time;
             if (f_time > vk_max_frame_ms) vk_max_frame_ms = f_time;
             if (f_time > 16.666) vk_frame_drops_60fps++;
+        }
+    }
+
+    /* Drain frames still in flight in the GPU pipeline */
+    {
+        cvp9_frame_info_t out_frame;
+        while (cvp9_get_frame_sync(vk_ctx, &out_frame) == CVP9_OK) {
+            vk_decoded_count++;
         }
     }
     double vk_end = get_time_ms();

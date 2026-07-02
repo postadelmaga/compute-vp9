@@ -3,11 +3,19 @@
  * compute-vp9 — VA-API driver entry point
  */
 #include <va/va_backend.h>
+#include <va/va_drmcommon.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 #include "compute_vp9/decoder.h"
 #include "decoder/vp9_frame.h"
+
+/* DRM fourccs (avoid a libdrm header dependency) */
+#define CVP9_DRM_FORMAT_R8   0x20203852  /* 'R8  ' */
+#define CVP9_DRM_FORMAT_GR88 0x38385247  /* 'GR88' */
+#define CVP9_DRM_FORMAT_NV12 0x3231564E  /* 'NV12' */
+#define CVP9_DRM_MOD_LINEAR  0
 
 #define CVP9_VA_VERSION_MAJOR 0
 #define CVP9_VA_VERSION_MINOR 1
@@ -15,6 +23,7 @@
 #define MAX_SURFACES 32
 #define MAX_BUFFERS 128
 #define MAX_IMAGES 32
+#define MAX_PENDING 8
 
 /* ── Driver private structures ───────────────────────────────────────────── */
 typedef struct {
@@ -24,15 +33,32 @@ typedef struct {
     void        *data;
 } cvp9_buffer_t;
 
+/* A render-target surface: CPU I420 planes (canonical storage) plus an
+ * optional NV12 DMA-BUF backing so clients (Chrome) can import the surface
+ * zero-copy via vaExportSurfaceHandle. */
+typedef struct {
+    cvp9_frame_info_t    frame;
+    cvp9_export_buffer_t exp;
+    int                  has_export;
+} cvp9_surface_t;
+
 typedef struct {
     cvp9_ctx_t        *decoder;
-    cvp9_frame_info_t  surfaces[MAX_SURFACES];
+    cvp9_surface_t     surfaces[MAX_SURFACES];
     cvp9_buffer_t     *buffers[MAX_BUFFERS];
 
     /* Render context state */
     VASurfaceID        current_render_target;
     uint8_t           *bitstream_buffer;
     size_t             bitstream_size;
+
+    /* GPU-pipelined frames awaiting delivery: decode is submitted in
+     * vaEndPicture but the result is copied to its render target only when
+     * ready (opportunistically) or in vaSyncSurface (blocking), so several
+     * frames overlap on CPU+GPU at the cost of a few frames of latency. */
+    VASurfaceID        pending_targets[MAX_PENDING];
+    int                pending_head;
+    int                pending_count;
 
     /* VA-API parameters */
     VADecPictureParameterBufferVP9 pic_param;
@@ -97,6 +123,61 @@ static VAStatus cvp9_DestroyConfig(VADriverContextP ctx, VAConfigID config_id)
 }
 
 /* ── Surface Management ──────────────────────────────────────────────────── */
+
+/* Re-pack the surface's I420 planes into its NV12 DMA-BUF backing so
+ * importers (Chrome's compositor) see the updated frame */
+static void cvp9_surface_write_nv12(cvp9_surface_t *s)
+{
+    if (!s->has_export || !s->frame.plane_y) return;
+
+    const cvp9_frame_info_t *f = &s->frame;
+    uint32_t w = f->width, h = f->height;
+    uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
+    uint8_t *dst_y = s->exp.mapped;
+    uint8_t *dst_uv = dst_y + (size_t)w * h;
+
+    for (uint32_t r = 0; r < h; r++) {
+        memcpy(dst_y + (size_t)r * w, f->plane_y + (size_t)r * f->stride_y, w);
+    }
+    for (uint32_t r = 0; r < ch; r++) {
+        const uint8_t *u = f->plane_u + (size_t)r * f->stride_uv;
+        const uint8_t *v = f->plane_v + (size_t)r * f->stride_uv;
+        uint8_t *uv = dst_uv + (size_t)r * 2 * cw;
+        for (uint32_t c = 0; c < cw; c++) {
+            uv[2 * c]     = u[c];
+            uv[2 * c + 1] = v[c];
+        }
+    }
+}
+
+static VAStatus cvp9_create_surfaces_common(
+        cvp9_driver_data_t *drv,
+        unsigned int width, unsigned int height,
+        unsigned int num_surfaces, VASurfaceID *surfaces)
+{
+    for (unsigned int i = 0; i < num_surfaces; i++) {
+        int slot = -1;
+        for (int s = 0; s < MAX_SURFACES; s++) {
+            if (!drv->surfaces[s].frame.plane_y) { slot = s; break; }
+        }
+        if (slot == -1) return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+        cvp9_surface_t *surf = &drv->surfaces[slot];
+        if (!cvp9_frame_alloc(&surf->frame, width, height))
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
+
+        /* NV12 DMA-BUF backing for zero-copy import by the client */
+        uint32_t cw = (width + 1) / 2, ch = (height + 1) / 2;
+        uint64_t nv12_size = (uint64_t)width * height + 2ull * cw * ch;
+        surf->has_export =
+            (cvp9_export_buffer_alloc(drv->decoder, nv12_size, &surf->exp) == CVP9_OK &&
+             surf->exp.fd >= 0);
+
+        surfaces[i] = (VASurfaceID)(slot + 1);
+    }
+    return VA_STATUS_SUCCESS;
+}
+
 static VAStatus cvp9_CreateSurfaces(
         VADriverContextP ctx,
         int width, int height, int format,
@@ -104,18 +185,33 @@ static VAStatus cvp9_CreateSurfaces(
 {
     cvp9_driver_data_t *drv = GET_DRIVER(ctx);
     if (!drv) return VA_STATUS_ERROR_INVALID_CONTEXT;
+    (void)format;
+    return cvp9_create_surfaces_common(drv, width, height, num_surfaces, surfaces);
+}
 
-    for (int i = 0; i < num_surfaces; i++) {
-        int slot = -1;
-        for (int s = 0; s < MAX_SURFACES; s++) {
-            if (!drv->surfaces[s].plane_y) { slot = s; break; }
+static VAStatus cvp9_CreateSurfaces2(
+        VADriverContextP ctx,
+        unsigned int format,
+        unsigned int width, unsigned int height,
+        VASurfaceID *surfaces, unsigned int num_surfaces,
+        VASurfaceAttrib *attrib_list, unsigned int num_attribs)
+{
+    cvp9_driver_data_t *drv = GET_DRIVER(ctx);
+    if (!drv) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    /* Accept the pixel formats we can serve (NV12 via export, I420 via
+     * vaGetImage); reject anything else */
+    for (unsigned int i = 0; attrib_list && i < num_attribs; i++) {
+        if (attrib_list[i].type == VASurfaceAttribPixelFormat &&
+            (attrib_list[i].flags & VA_SURFACE_ATTRIB_SETTABLE)) {
+            uint32_t fourcc = (uint32_t)attrib_list[i].value.value.i;
+            if (fourcc != 0 && fourcc != VA_FOURCC_NV12 && fourcc != VA_FOURCC_I420) {
+                return VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT;
+            }
         }
-        if (slot == -1) return VA_STATUS_ERROR_ALLOCATION_FAILED;
-
-        cvp9_frame_alloc(&drv->surfaces[slot], width, height);
-        surfaces[i] = (VASurfaceID)(slot + 1);
     }
-    return VA_STATUS_SUCCESS;
+    (void)format;
+    return cvp9_create_surfaces_common(drv, width, height, num_surfaces, surfaces);
 }
 
 static VAStatus cvp9_DestroySurfaces(
@@ -128,7 +224,11 @@ static VAStatus cvp9_DestroySurfaces(
     for (int i = 0; i < num_surfaces; i++) {
         int slot = (int)surfaces[i] - 1;
         if (slot >= 0 && slot < MAX_SURFACES) {
-            cvp9_frame_free(&drv->surfaces[slot]);
+            cvp9_frame_free(&drv->surfaces[slot].frame);
+            if (drv->surfaces[slot].has_export) {
+                cvp9_export_buffer_free(drv->decoder, &drv->surfaces[slot].exp);
+                drv->surfaces[slot].has_export = 0;
+            }
         }
     }
     return VA_STATUS_SUCCESS;
@@ -292,41 +392,92 @@ static VAStatus cvp9_RenderPicture(VADriverContextP ctx,
     return VA_STATUS_SUCCESS;
 }
 
+/* Deliver one decoded frame to its queued render target */
+static void cvp9_deliver_frame(cvp9_driver_data_t *drv, const cvp9_frame_info_t *frame)
+{
+    if (drv->pending_count == 0) return;
+    int target = (int)drv->pending_targets[drv->pending_head] - 1;
+    drv->pending_head = (drv->pending_head + 1) % MAX_PENDING;
+    drv->pending_count--;
+    if (target >= 0 && target < MAX_SURFACES) {
+        cvp9_frame_copy(&drv->surfaces[target].frame, frame);
+        cvp9_surface_write_nv12(&drv->surfaces[target]);
+    }
+}
+
+/* Copy every already-finished frame to its render target without blocking */
+static void cvp9_drain_ready_frames(cvp9_driver_data_t *drv)
+{
+    cvp9_frame_info_t frame;
+    while (drv->pending_count > 0 &&
+           cvp9_get_frame(drv->decoder, &frame) == CVP9_OK) {
+        cvp9_deliver_frame(drv, &frame);
+    }
+}
+
+static bool cvp9_surface_pending(const cvp9_driver_data_t *drv, VASurfaceID surface)
+{
+    for (int i = 0; i < drv->pending_count; i++) {
+        if (drv->pending_targets[(drv->pending_head + i) % MAX_PENDING] == surface)
+            return true;
+    }
+    return false;
+}
+
 static VAStatus cvp9_EndPicture(VADriverContextP ctx, VAContextID ctx_id)
 {
     cvp9_driver_data_t *drv = GET_DRIVER(ctx);
     if (!drv) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (drv->bitstream_size == 0) return VA_STATUS_SUCCESS;
 
-    /* Decode frame */
+    /* Submit decode; if the GPU pipeline is full, deliver the oldest frame
+     * first (blocking) and retry */
     cvp9_err_t err;
-    if (drv->has_pic_param && drv->has_slice_param) {
-        err = cvp9_decode_vaapi(drv->decoder, drv->bitstream_buffer, drv->bitstream_size, 0,
-                                 &drv->pic_param, &drv->slice_param);
-    } else {
-        err = cvp9_decode(drv->decoder, drv->bitstream_buffer, drv->bitstream_size, 0);
+    for (;;) {
+        if (drv->has_pic_param && drv->has_slice_param) {
+            err = cvp9_decode_vaapi(drv->decoder, drv->bitstream_buffer, drv->bitstream_size, 0,
+                                     &drv->pic_param, &drv->slice_param);
+        } else {
+            err = cvp9_decode(drv->decoder, drv->bitstream_buffer, drv->bitstream_size, 0);
+        }
+        if (err != CVP9_ERR_AGAIN) break;
+
+        cvp9_frame_info_t frame;
+        if (cvp9_get_frame_sync(drv->decoder, &frame) != CVP9_OK) break;
+        cvp9_deliver_frame(drv, &frame);
     }
     if (err != CVP9_OK) {
         fprintf(stderr, "[compute-vp9] VA-API decode failed: %d\n", err);
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
 
-    /* Retrieve and copy YUV frames */
-    cvp9_frame_info_t frame;
-    err = cvp9_get_frame(drv->decoder, &frame);
-    if (err == CVP9_OK) {
-        int target = (int)drv->current_render_target - 1;
-        if (target >= 0 && target < MAX_SURFACES) {
-            cvp9_frame_copy(&drv->surfaces[target], &frame);
-        }
+    /* Queue the render target for asynchronous delivery */
+    if (drv->pending_count < MAX_PENDING) {
+        drv->pending_targets[(drv->pending_head + drv->pending_count) % MAX_PENDING] =
+            drv->current_render_target;
+        drv->pending_count++;
     }
+
+    /* Opportunistically deliver whatever the GPU already finished */
+    cvp9_drain_ready_frames(drv);
 
     return VA_STATUS_SUCCESS;
 }
 
 static VAStatus cvp9_SyncSurface(VADriverContextP ctx, VASurfaceID surface)
 {
-    (void)ctx; (void)surface;
+    cvp9_driver_data_t *drv = GET_DRIVER(ctx);
+    if (!drv) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    while (cvp9_surface_pending(drv, surface)) {
+        cvp9_frame_info_t frame;
+        if (cvp9_get_frame_sync(drv->decoder, &frame) != CVP9_OK) {
+            /* Decoder lost the pipeline (e.g. resolution change) — drop */
+            drv->pending_count = 0;
+            break;
+        }
+        cvp9_deliver_frame(drv, &frame);
+    }
     return VA_STATUS_SUCCESS;
 }
 
@@ -383,7 +534,7 @@ static VAStatus cvp9_GetImage(
 
     int surf_slot = (int)surface - 1;
     if (surf_slot < 0 || surf_slot >= MAX_SURFACES) return VA_STATUS_ERROR_INVALID_SURFACE;
-    cvp9_frame_info_t *surf_frame = &drv->surfaces[surf_slot];
+    cvp9_frame_info_t *surf_frame = &drv->surfaces[surf_slot].frame;
     if (!surf_frame->plane_y) return VA_STATUS_ERROR_INVALID_SURFACE;
 
     int buf_slot = (int)image_id - 1;
@@ -426,11 +577,14 @@ static VAStatus cvp9_Terminate(VADriverContextP ctx)
 {
     cvp9_driver_data_t *drv = GET_DRIVER(ctx);
     if (drv) {
-        if (drv->decoder) cvp9_destroy(drv->decoder);
-
         for (int i = 0; i < MAX_SURFACES; i++) {
-            cvp9_frame_free(&drv->surfaces[i]);
+            cvp9_frame_free(&drv->surfaces[i].frame);
+            if (drv->surfaces[i].has_export && drv->decoder) {
+                cvp9_export_buffer_free(drv->decoder, &drv->surfaces[i].exp);
+            }
         }
+
+        if (drv->decoder) cvp9_destroy(drv->decoder);
 
         for (int i = 0; i < MAX_BUFFERS; i++) {
             if (drv->buffers[i]) {
@@ -446,10 +600,189 @@ static VAStatus cvp9_Terminate(VADriverContextP ctx)
     return VA_STATUS_SUCCESS;
 }
 
-static VAStatus cvp9_QueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id, VAProfile *profile, VAEntrypoint *entrypoint, VAConfigAttrib *attrib_list, int *num_attribs) { return VA_STATUS_ERROR_UNIMPLEMENTED; }
-static VAStatus cvp9_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEntrypoint entrypoint, VAConfigAttrib *attrib_list, int num_attribs) { return VA_STATUS_ERROR_UNIMPLEMENTED; }
+static VAStatus cvp9_QueryConfigAttributes(VADriverContextP ctx, VAConfigID config_id, VAProfile *profile, VAEntrypoint *entrypoint, VAConfigAttrib *attrib_list, int *num_attribs)
+{
+    VAProfile prof = (VAProfile)config_id;
+    if (prof != VAProfileVP9Profile0 && prof != VAProfileVP9Profile2) {
+        return VA_STATUS_ERROR_INVALID_CONFIG;
+    }
+    *profile = prof;
+    *entrypoint = VAEntrypointVLD;
+
+    attrib_list[0].type = VAConfigAttribRTFormat;
+    if (prof == VAProfileVP9Profile2) {
+        attrib_list[0].value = VA_RT_FORMAT_YUV420_10;
+    } else {
+        attrib_list[0].value = VA_RT_FORMAT_YUV420;
+    }
+    *num_attribs = 1;
+    return VA_STATUS_SUCCESS;
+}
+
+static VAStatus cvp9_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEntrypoint entrypoint, VAConfigAttrib *attrib_list, int num_attribs)
+{
+    if (profile != VAProfileVP9Profile0 && profile != VAProfileVP9Profile2) {
+        return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
+    }
+    if (entrypoint != VAEntrypointVLD) {
+        return VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT;
+    }
+
+    for (int i = 0; i < num_attribs; i++) {
+        switch (attrib_list[i].type) {
+        case VAConfigAttribRTFormat:
+            if (profile == VAProfileVP9Profile2) {
+                attrib_list[i].value = VA_RT_FORMAT_YUV420_10;
+            } else {
+                attrib_list[i].value = VA_RT_FORMAT_YUV420;
+            }
+            break;
+        default:
+            attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
+            break;
+        }
+    }
+    return VA_STATUS_SUCCESS;
+}
+/* Chrome's VaapiWrapper::FillProfileInfo_Locked requires this to enumerate
+ * supported surface formats and resolution limits for each profile. */
+static VAStatus cvp9_QuerySurfaceAttributes(
+        VADriverContextP ctx, VAConfigID config,
+        VASurfaceAttrib *attrib_list, unsigned int *num_attribs)
+{
+    (void)ctx; (void)config;
+    enum { CVP9_NUM_SURFACE_ATTRIBS = 7 };
+
+    if (!num_attribs) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    if (!attrib_list) {  /* size query */
+        *num_attribs = CVP9_NUM_SURFACE_ATTRIBS;
+        return VA_STATUS_SUCCESS;
+    }
+    if (*num_attribs < CVP9_NUM_SURFACE_ATTRIBS) {
+        *num_attribs = CVP9_NUM_SURFACE_ATTRIBS;
+        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+    }
+
+    unsigned int i = 0;
+
+    attrib_list[i].type = VASurfaceAttribPixelFormat;
+    attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+    attrib_list[i].value.type = VAGenericValueTypeInteger;
+    attrib_list[i].value.value.i = VA_FOURCC_NV12;
+    i++;
+
+    attrib_list[i].type = VASurfaceAttribPixelFormat;
+    attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+    attrib_list[i].value.type = VAGenericValueTypeInteger;
+    attrib_list[i].value.value.i = VA_FOURCC_I420;
+    i++;
+
+    attrib_list[i].type = VASurfaceAttribMinWidth;
+    attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[i].value.type = VAGenericValueTypeInteger;
+    attrib_list[i].value.value.i = 16;
+    i++;
+
+    attrib_list[i].type = VASurfaceAttribMinHeight;
+    attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[i].value.type = VAGenericValueTypeInteger;
+    attrib_list[i].value.value.i = 16;
+    i++;
+
+    attrib_list[i].type = VASurfaceAttribMaxWidth;
+    attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[i].value.type = VAGenericValueTypeInteger;
+    attrib_list[i].value.value.i = 8192;
+    i++;
+
+    attrib_list[i].type = VASurfaceAttribMaxHeight;
+    attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE;
+    attrib_list[i].value.type = VAGenericValueTypeInteger;
+    attrib_list[i].value.value.i = 8192;
+    i++;
+
+    attrib_list[i].type = VASurfaceAttribMemoryType;
+    attrib_list[i].flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+    attrib_list[i].value.type = VAGenericValueTypeInteger;
+    attrib_list[i].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
+    i++;
+
+    *num_attribs = i;
+    return VA_STATUS_SUCCESS;
+}
+
+/* Zero-copy surface export as DRM PRIME 2 (NV12 DMA-BUF) — the path
+ * Chrome's VaapiVideoDecoder uses to hand decoded frames to the compositor */
+static VAStatus cvp9_ExportSurfaceHandle(
+        VADriverContextP ctx, VASurfaceID surface_id,
+        uint32_t mem_type, uint32_t flags, void *descriptor)
+{
+    cvp9_driver_data_t *drv = GET_DRIVER(ctx);
+    if (!drv) return VA_STATUS_ERROR_INVALID_CONTEXT;
+
+    if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2)
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+
+    int slot = (int)surface_id - 1;
+    if (slot < 0 || slot >= MAX_SURFACES || !drv->surfaces[slot].frame.plane_y)
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+
+    cvp9_surface_t *s = &drv->surfaces[slot];
+    if (!s->has_export) return VA_STATUS_ERROR_OPERATION_FAILED;
+
+    uint32_t w = s->frame.width, h = s->frame.height;
+    uint32_t cw = (w + 1) / 2;
+    uint32_t pitch_y = w, pitch_uv = 2 * cw;
+    uint32_t offset_uv = w * h;
+
+    int fd = dup(s->exp.fd);
+    if (fd < 0) return VA_STATUS_ERROR_OPERATION_FAILED;
+
+    VADRMPRIMESurfaceDescriptor *d = descriptor;
+    memset(d, 0, sizeof(*d));
+    d->fourcc = VA_FOURCC_NV12;
+    d->width = w;
+    d->height = h;
+    d->num_objects = 1;
+    d->objects[0].fd = fd;
+    d->objects[0].size = s->exp.size;
+    d->objects[0].drm_format_modifier = CVP9_DRM_MOD_LINEAR;
+
+    if (flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS) {
+        d->num_layers = 1;
+        d->layers[0].drm_format = CVP9_DRM_FORMAT_NV12;
+        d->layers[0].num_planes = 2;
+        d->layers[0].object_index[0] = 0;
+        d->layers[0].object_index[1] = 0;
+        d->layers[0].offset[0] = 0;
+        d->layers[0].offset[1] = offset_uv;
+        d->layers[0].pitch[0] = pitch_y;
+        d->layers[0].pitch[1] = pitch_uv;
+    } else {
+        d->num_layers = 2;
+        d->layers[0].drm_format = CVP9_DRM_FORMAT_R8;
+        d->layers[0].num_planes = 1;
+        d->layers[0].object_index[0] = 0;
+        d->layers[0].offset[0] = 0;
+        d->layers[0].pitch[0] = pitch_y;
+        d->layers[1].drm_format = CVP9_DRM_FORMAT_GR88;
+        d->layers[1].num_planes = 1;
+        d->layers[1].object_index[0] = 0;
+        d->layers[1].offset[0] = offset_uv;
+        d->layers[1].pitch[0] = pitch_uv;
+    }
+
+    return VA_STATUS_SUCCESS;
+}
+
 static VAStatus cvp9_BufferSetNumElements(VADriverContextP ctx, VABufferID buf_id, unsigned int num_elements) { return VA_STATUS_SUCCESS; }
-static VAStatus cvp9_QuerySurfaceStatus(VADriverContextP ctx, VASurfaceID surface, VASurfaceStatus *status) { *status = VASurfaceReady; return VA_STATUS_SUCCESS; }
+static VAStatus cvp9_QuerySurfaceStatus(VADriverContextP ctx, VASurfaceID surface, VASurfaceStatus *status)
+{
+    cvp9_driver_data_t *drv = GET_DRIVER(ctx);
+    if (drv) cvp9_drain_ready_frames(drv);
+    *status = (drv && cvp9_surface_pending(drv, surface)) ? VASurfaceRendering : VASurfaceReady;
+    return VA_STATUS_SUCCESS;
+}
 static VAStatus cvp9_QueryImageFormats(VADriverContextP ctx, VAImageFormat *format_list, int *num_formats) {
     if (format_list) {
         format_list[0].fourcc = VA_FOURCC_I420;
@@ -522,6 +855,11 @@ VAStatus __vaDriverInit_0_40(VADriverContextP ctx)
     vtable->vaCreateImage            = cvp9_CreateImage;
     vtable->vaDestroyImage           = cvp9_DestroyImage;
     vtable->vaGetImage               = cvp9_GetImage;
+
+    /* Entrypoints required by Chrome's VaapiWrapper */
+    vtable->vaQuerySurfaceAttributes = cvp9_QuerySurfaceAttributes;
+    vtable->vaCreateSurfaces2        = cvp9_CreateSurfaces2;
+    vtable->vaExportSurfaceHandle    = cvp9_ExportSurfaceHandle;
 
     /* Populating additional vtable items to satisfy strict libva check */
     vtable->vaQueryConfigAttributes  = cvp9_QueryConfigAttributes;

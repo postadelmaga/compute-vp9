@@ -212,14 +212,15 @@ cvp9_err_t cvp9_decode(cvp9_ctx_t *ctx,
     return err;
 }
 
-cvp9_err_t cvp9_get_frame(cvp9_ctx_t *ctx, cvp9_frame_info_t *info)
+static cvp9_err_t get_frame_common(cvp9_ctx_t *ctx, cvp9_frame_info_t *info, int wait)
 {
     if (!ctx || !info) return CVP9_ERR_INVALID_DATA;
 
 #ifdef ENABLE_VULKAN
     if (ctx->backend == CVP9_BACKEND_VULKAN)
-        return vulkan_get_frame(ctx->backend_ctx, info);
+        return vulkan_get_frame(ctx->backend_ctx, info, wait);
 #endif
+    (void)wait;  /* CPU frames are always ready once queued */
 
     if (ctx->frame_count > 0) {
         *info = ctx->frames[ctx->frame_rd];
@@ -229,6 +230,50 @@ cvp9_err_t cvp9_get_frame(cvp9_ctx_t *ctx, cvp9_frame_info_t *info)
     }
 
     return CVP9_ERR_UNSUPPORTED;
+}
+
+cvp9_err_t cvp9_get_frame(cvp9_ctx_t *ctx, cvp9_frame_info_t *info)
+{
+    return get_frame_common(ctx, info, 0);
+}
+
+cvp9_err_t cvp9_get_frame_sync(cvp9_ctx_t *ctx, cvp9_frame_info_t *info)
+{
+    return get_frame_common(ctx, info, 1);
+}
+
+cvp9_err_t cvp9_get_frame_dmabuf(cvp9_ctx_t *ctx, cvp9_dmabuf_frame_t *out)
+{
+    if (!ctx || !out) return CVP9_ERR_INVALID_DATA;
+
+#ifdef ENABLE_VULKAN
+    if (ctx->backend == CVP9_BACKEND_VULKAN)
+        return vulkan_get_frame_dmabuf(ctx->backend_ctx, out);
+#endif
+
+    return CVP9_ERR_UNSUPPORTED;
+}
+
+cvp9_err_t cvp9_export_buffer_alloc(cvp9_ctx_t *ctx, uint64_t size, cvp9_export_buffer_t *out)
+{
+    if (!ctx || !out) return CVP9_ERR_INVALID_DATA;
+
+#ifdef ENABLE_VULKAN
+    if (ctx->backend == CVP9_BACKEND_VULKAN)
+        return vulkan_export_buffer_alloc(ctx->backend_ctx, size, out);
+#endif
+
+    return CVP9_ERR_UNSUPPORTED;
+}
+
+void cvp9_export_buffer_free(cvp9_ctx_t *ctx, cvp9_export_buffer_t *buf)
+{
+    if (!ctx || !buf) return;
+
+#ifdef ENABLE_VULKAN
+    if (ctx->backend == CVP9_BACKEND_VULKAN)
+        vulkan_export_buffer_free(ctx->backend_ctx, buf);
+#endif
 }
 
 cvp9_backend_t cvp9_active_backend(const cvp9_ctx_t *ctx)
@@ -245,6 +290,7 @@ const char *cvp9_err_str(cvp9_err_t err)
     case CVP9_ERR_INVALID_DATA: return "Invalid bitstream data";
     case CVP9_ERR_UNSUPPORTED:  return "Unsupported operation";
     case CVP9_ERR_GPU:          return "GPU error";
+    case CVP9_ERR_AGAIN:        return "Frame not ready yet (try again)";
     default:                    return "Unknown error";
     }
 }

@@ -7,17 +7,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 #include "decoder/vp9_frame.h"
 
-/* Helper: load SPIR-V shader module from the build directory */
+/* Helper: load SPIR-V shader module. Search order:
+ *   1. $CVP9_SHADER_DIR (explicit override)
+ *   2. build directory (development runs)
+ *   3. system install directory (installed runs)             */
 static VkShaderModule load_shader_module(VkDevice device, const char *filename)
 {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/%s", SPIRV_OUTPUT_DIR, filename);
+    const char *dirs[3];
+    int ndirs = 0;
+    const char *env_dir = getenv("CVP9_SHADER_DIR");
+    if (env_dir && env_dir[0]) dirs[ndirs++] = env_dir;
+#ifdef SPIRV_OUTPUT_DIR
+    dirs[ndirs++] = SPIRV_OUTPUT_DIR;
+#endif
+#ifdef CVP9_SHADER_INSTALL_DIR
+    dirs[ndirs++] = CVP9_SHADER_INSTALL_DIR;
+#endif
 
-    FILE *f = fopen(path, "rb");
+    char path[512];
+    FILE *f = NULL;
+    for (int i = 0; i < ndirs && !f; i++) {
+        snprintf(path, sizeof(path), "%s/%s", dirs[i], filename);
+        f = fopen(path, "rb");
+    }
     if (!f) {
-        fprintf(stderr, "[compute-vp9] Failed to open shader: %s\n", path);
+        fprintf(stderr, "[compute-vp9] Failed to open shader %s (searched %d dirs)\n",
+                filename, ndirs);
         return VK_NULL_HANDLE;
     }
 
@@ -175,6 +193,157 @@ static VkResult create_buffer(VkDevice device, VkPhysicalDevice phys, VkDeviceSi
     return VK_SUCCESS;
 }
 
+/* Pick the first memory type matching any flag set in priority order */
+static uint32_t find_memory_type_chain(VkPhysicalDevice phys, uint32_t type_filter,
+                                       const VkMemoryPropertyFlags *candidates, int n)
+{
+    for (int c = 0; c < n; c++) {
+        uint32_t t = find_memory_type(phys, type_filter, candidates[c]);
+        if (t != (uint32_t)-1) return t;
+    }
+    return (uint32_t)-1;
+}
+
+/* Allocate a CPU-mappable buffer whose memory is exported as a DMA-BUF fd
+ * (dedicated allocation), so a second GPU/API can import the decoded frame
+ * over PCIe without a CPU bounce (see Gear's vulkan_external_memory_bench:
+ * HOST_VISIBLE|HOST_CACHED export memory enables the "true zero-copy" path
+ * on unified-memory iGPUs). */
+static VkResult create_exportable_buffer(vulkan_ctx_t *vk, VkDeviceSize size,
+                                         VkBufferUsageFlags usage,
+                                         VkBuffer *out_buf, VkDeviceMemory *out_mem,
+                                         void **out_mapped, int *out_fd)
+{
+    static const VkMemoryPropertyFlags host_candidates[] = {
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+            VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+    };
+
+    VkExternalMemoryBufferCreateInfo ext_info = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    };
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = &ext_info,
+        .size = size,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkResult res = vkCreateBuffer(vk->device, &buffer_info, NULL, &buf);
+    if (res != VK_SUCCESS) return res;
+
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk->device, buf, &reqs);
+    uint32_t mem_type = find_memory_type_chain(vk->phys_device, reqs.memoryTypeBits,
+                                               host_candidates, 4);
+    if (mem_type == (uint32_t)-1) {
+        vkDestroyBuffer(vk->device, buf, NULL);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+
+    VkMemoryDedicatedAllocateInfo dedicated = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+        .buffer = buf
+    };
+    VkExportMemoryAllocateInfo export_info = {
+        .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+        .pNext = &dedicated,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    };
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &export_info,
+        .allocationSize = reqs.size,
+        .memoryTypeIndex = mem_type
+    };
+    res = vkAllocateMemory(vk->device, &alloc_info, NULL, &mem);
+    if (res != VK_SUCCESS) {
+        vkDestroyBuffer(vk->device, buf, NULL);
+        return res;
+    }
+    void *mapped = NULL;
+    if (vkBindBufferMemory(vk->device, buf, mem, 0) != VK_SUCCESS ||
+        vkMapMemory(vk->device, mem, 0, size, 0, &mapped) != VK_SUCCESS) {
+        vkFreeMemory(vk->device, mem, NULL);
+        vkDestroyBuffer(vk->device, buf, NULL);
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
+
+    VkMemoryGetFdInfoKHR fd_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+        .memory = mem,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    };
+    int fd = -1;
+    if (!vk->pfn_get_memory_fd ||
+        vk->pfn_get_memory_fd(vk->device, &fd_info, &fd) != VK_SUCCESS) {
+        fd = -1;
+    }
+
+    *out_buf = buf;
+    *out_mem = mem;
+    *out_mapped = mapped;
+    *out_fd = fd;
+    return VK_SUCCESS;
+}
+
+/* Create a slot's host-visible output buffer, exportable when possible.
+ * Falls back to a plain buffer on failure. */
+static VkResult create_output_buffer(vulkan_ctx_t *vk, VkDeviceSize size, vk_frame_slot_t *slot)
+{
+
+    slot->dmabuf_fd = -1;
+
+    if (vk->ext_dmabuf) {
+        int fd = -1;
+        if (create_exportable_buffer(vk, size,
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                &slot->output_buf, &slot->output_mem,
+                &slot->output_mapped, &fd) == VK_SUCCESS) {
+            slot->dmabuf_fd = fd;
+            return VK_SUCCESS;
+        }
+        fprintf(stderr, "[compute-vp9] DMA-BUF export alloc failed, using plain output buffer\n");
+    }
+
+    VkResult res = create_buffer(vk->device, vk->phys_device, size,
+                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                  &slot->output_buf, &slot->output_mem);
+    if (res != VK_SUCCESS) {
+        /* Some devices expose no HOST_CACHED type — take plain coherent */
+        res = create_buffer(vk->device, vk->phys_device, size,
+                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  &slot->output_buf, &slot->output_mem);
+    }
+    if (res != VK_SUCCESS) return res;
+    return vkMapMemory(vk->device, slot->output_mem, 0, size, 0, &slot->output_mapped);
+}
+
+static void destroy_slot_output(vulkan_ctx_t *vk, vk_frame_slot_t *slot)
+{
+    if (slot->output_buf != VK_NULL_HANDLE) {
+        if (slot->output_mapped) vkUnmapMemory(vk->device, slot->output_mem);
+        vkDestroyBuffer(vk->device, slot->output_buf, NULL);
+        vkFreeMemory(vk->device, slot->output_mem, NULL);
+        slot->output_buf = VK_NULL_HANDLE;
+        slot->output_mapped = NULL;
+    }
+    if (slot->dmabuf_fd >= 0) {
+        close(slot->dmabuf_fd);
+        slot->dmabuf_fd = -1;
+    }
+}
+
 /* Helper: allocate a descriptor set */
 static void bind_image_to_descriptor(VkDevice device, VkDescriptorSet set, uint32_t binding, VkImageView view, VkSampler sampler)
 {
@@ -235,7 +404,17 @@ static VkResult ensure_buffers(vulkan_ctx_t *vk, uint32_t width, uint32_t height
     if (vk->width == width && vk->height == height && vk->dst_buf != VK_NULL_HANDLE) {
         return VK_SUCCESS;
     }
-    
+
+    /* Resolution change: drain the GPU before touching shared buffers.
+     * Any undelivered in-flight frames are dropped (stream restart). */
+    vkDeviceWaitIdle(vk->device);
+    for (int i = 0; i < CVP9_INFLIGHT; i++) {
+        vk->slots[i].pending = 0;
+        destroy_slot_output(vk, &vk->slots[i]);
+    }
+    vk->ring_head = 0;
+    vk->ring_count = 0;
+
     /* Clean up old buffers */
     if (vk->dst_buf != VK_NULL_HANDLE) {
         vkDestroyBuffer(vk->device, vk->dst_buf, NULL);
@@ -324,26 +503,14 @@ static VkResult ensure_buffers(vulkan_ctx_t *vk, uint32_t width, uint32_t height
         fprintf(stderr, "[compute-vp9] Failed to create left_buf: %d\n", res);
         return res;
     }
-    
-    if (vk->output_buf != VK_NULL_HANDLE) {
-        vkUnmapMemory(vk->device, vk->output_mem);
-        vkDestroyBuffer(vk->device, vk->output_buf, NULL);
-        vkFreeMemory(vk->device, vk->output_mem, NULL);
-        vk->output_buf = VK_NULL_HANDLE;
-    }
+
     vk->output_size = yuv_size;
-    res = create_buffer(vk->device, vk->phys_device, yuv_size,
-                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-                  &vk->output_buf, &vk->output_mem);
-    if (res != VK_SUCCESS) {
-        fprintf(stderr, "[compute-vp9] Failed to create output_buf: %d\n", res);
-        return res;
-    }
-    res = vkMapMemory(vk->device, vk->output_mem, 0, yuv_size, 0, &vk->output_mapped);
-    if (res != VK_SUCCESS) {
-        fprintf(stderr, "[compute-vp9] Failed to map output_mem: %d\n", res);
-        return res;
+    for (int i = 0; i < CVP9_INFLIGHT; i++) {
+        res = create_output_buffer(vk, yuv_size, &vk->slots[i]);
+        if (res != VK_SUCCESS) {
+            fprintf(stderr, "[compute-vp9] Failed to create output buffer %d: %d\n", i, res);
+            return res;
+        }
     }
 
     return VK_SUCCESS;
@@ -353,6 +520,7 @@ cvp9_err_t vulkan_backend_init(void **ctx)
 {
     vulkan_ctx_t *vk = calloc(1, sizeof(*vk));
     if (!vk) return CVP9_ERR_NOMEM;
+    for (int i = 0; i < CVP9_INFLIGHT; i++) vk->slots[i].dmabuf_fd = -1;
 
     VkApplicationInfo app_info = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -360,7 +528,7 @@ cvp9_err_t vulkan_backend_init(void **ctx)
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
         .pEngineName = "No Engine",
         .engineVersion = VK_MAKE_VERSION(1, 0, 0),
-        .apiVersion = VK_API_VERSION_1_0
+        .apiVersion = VK_API_VERSION_1_1
     };
 
     VkInstanceCreateInfo create_info = {
@@ -457,11 +625,48 @@ cvp9_err_t vulkan_backend_init(void **ctx)
         .storageBuffer8BitAccess = VK_TRUE
     };
 
+    /* Probe DMA-BUF external memory support so decoded frames can be shared
+     * zero-copy with a second GPU (compositor/display) over PCIe */
+    const char *wanted_exts[] = {
+        VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+    };
+    const char *enabled_exts[3];
+    uint32_t enabled_ext_count = 0;
+
+    VkPhysicalDeviceProperties dev_props;
+    vkGetPhysicalDeviceProperties(vk->phys_device, &dev_props);
+    if (dev_props.apiVersion >= VK_API_VERSION_1_1) {
+        uint32_t ext_count = 0;
+        vkEnumerateDeviceExtensionProperties(vk->phys_device, NULL, &ext_count, NULL);
+        VkExtensionProperties *exts = malloc(sizeof(VkExtensionProperties) * ext_count);
+        if (exts) {
+            vkEnumerateDeviceExtensionProperties(vk->phys_device, NULL, &ext_count, exts);
+            uint32_t found = 0;
+            for (int w = 0; w < 3; w++) {
+                for (uint32_t e = 0; e < ext_count; e++) {
+                    if (strcmp(exts[e].extensionName, wanted_exts[w]) == 0) {
+                        found++;
+                        break;
+                    }
+                }
+            }
+            if (found == 3) {
+                for (int w = 0; w < 3; w++) enabled_exts[enabled_ext_count++] = wanted_exts[w];
+                vk->ext_dmabuf = 1;
+            }
+            free(exts);
+        }
+    }
+
     VkDeviceCreateInfo device_create_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &features8,
         .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = &queue_create_info
+        .pQueueCreateInfos = &queue_create_info,
+        .enabledExtensionCount = enabled_ext_count,
+        .ppEnabledExtensionNames = enabled_ext_count ? enabled_exts : NULL
     };
 
     res = vkCreateDevice(vk->phys_device, &device_create_info, NULL, &vk->device);
@@ -470,6 +675,14 @@ cvp9_err_t vulkan_backend_init(void **ctx)
         free(vk);
         return CVP9_ERR_GPU;
     }
+
+    if (vk->ext_dmabuf) {
+        vk->pfn_get_memory_fd = (PFN_vkGetMemoryFdKHR)
+            vkGetDeviceProcAddr(vk->device, "vkGetMemoryFdKHR");
+        if (!vk->pfn_get_memory_fd) vk->ext_dmabuf = 0;
+    }
+    printf("[compute-vp9] DMA-BUF cross-GPU export: %s\n",
+           vk->ext_dmabuf ? "available" : "not available");
 
     vkGetDeviceQueue(vk->device, vk->compute_family, 0, &vk->compute_queue);
 
@@ -616,32 +829,20 @@ cvp9_err_t vulkan_backend_init(void **ctx)
     vkDestroyShaderModule(vk->device, mod_intra, NULL);
     vkDestroyShaderModule(vk->device, mod_loopfilter, NULL);
 
-    /* Descriptor Pool */
+    /* Descriptor Pool — one set of descriptor sets per in-flight slot */
     VkDescriptorPoolSize pool_size[2] = {
-        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 64 },
-        { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 32 }
+        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 16 * CVP9_INFLIGHT },
+        { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 4 * CVP9_INFLIGHT }
     };
 
     VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 32,
+        .maxSets = 8 * CVP9_INFLIGHT,
         .poolSizeCount = 2,
         .pPoolSizes = pool_size
     };
 
     vkCreateDescriptorPool(vk->device, &pool_info, NULL, &vk->desc_pool);
-
-    /* Allocate persistent descriptor sets */
-    vk->desc_mc = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_mc);
-    vk->desc_intra = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
-    vk->desc_idct = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
-    vk->desc_lf = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
-
-    if (vk->desc_mc == VK_NULL_HANDLE || vk->desc_intra == VK_NULL_HANDLE ||
-        vk->desc_idct == VK_NULL_HANDLE || vk->desc_lf == VK_NULL_HANDLE) {
-        vulkan_backend_destroy(vk);
-        return CVP9_ERR_GPU;
-    }
 
     /* Infrastructure */
     VkCommandPoolCreateInfo command_pool_info = {
@@ -652,11 +853,41 @@ cvp9_err_t vulkan_backend_init(void **ctx)
 
     vkCreateCommandPool(vk->device, &command_pool_info, NULL, &vk->cmd_pool);
 
+    /* Per-slot persistent resources: descriptor sets, command buffer, fence */
+    VkCommandBuffer cmds[CVP9_INFLIGHT];
+    VkCommandBufferAllocateInfo cmd_alloc = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = vk->cmd_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = CVP9_INFLIGHT
+    };
+    if (vkAllocateCommandBuffers(vk->device, &cmd_alloc, cmds) != VK_SUCCESS) {
+        vulkan_backend_destroy(vk);
+        return CVP9_ERR_GPU;
+    }
+
     VkFenceCreateInfo fence_info = {
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
     };
 
-    vkCreateFence(vk->device, &fence_info, NULL, &vk->fence);
+    for (int i = 0; i < CVP9_INFLIGHT; i++) {
+        vk_frame_slot_t *slot = &vk->slots[i];
+        slot->cmd = cmds[i];
+        slot->dmabuf_fd = -1;
+        if (vkCreateFence(vk->device, &fence_info, NULL, &slot->fence) != VK_SUCCESS) {
+            vulkan_backend_destroy(vk);
+            return CVP9_ERR_GPU;
+        }
+        slot->desc_mc = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_mc);
+        slot->desc_intra = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
+        slot->desc_idct = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
+        slot->desc_lf = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
+        if (slot->desc_mc == VK_NULL_HANDLE || slot->desc_intra == VK_NULL_HANDLE ||
+            slot->desc_idct == VK_NULL_HANDLE || slot->desc_lf == VK_NULL_HANDLE) {
+            vulkan_backend_destroy(vk);
+            return CVP9_ERR_GPU;
+        }
+    }
 
     *ctx = vk;
     return CVP9_OK;
@@ -668,29 +899,45 @@ void vulkan_backend_destroy(void *ctx)
     vulkan_ctx_t *vk = (vulkan_ctx_t *)ctx;
 
     if (vk->device) {
-        vkDestroyFence(vk->device, vk->fence, NULL);
+        vkDeviceWaitIdle(vk->device);
+
+        for (int i = 0; i < CVP9_INFLIGHT; i++) {
+            vk_frame_slot_t *slot = &vk->slots[i];
+            if (slot->fence != VK_NULL_HANDLE) {
+                vkDestroyFence(vk->device, slot->fence, NULL);
+            }
+            destroy_slot_output(vk, slot);
+            if (slot->coeff_buf != VK_NULL_HANDLE) {
+                if (slot->coeff_mapped) vkUnmapMemory(vk->device, slot->coeff_mem);
+                vkDestroyBuffer(vk->device, slot->coeff_buf, NULL);
+                vkFreeMemory(vk->device, slot->coeff_mem, NULL);
+            }
+            if (slot->mv_buf != VK_NULL_HANDLE) {
+                if (slot->mv_mapped) vkUnmapMemory(vk->device, slot->mv_mem);
+                vkDestroyBuffer(vk->device, slot->mv_buf, NULL);
+                vkFreeMemory(vk->device, slot->mv_mem, NULL);
+            }
+            if (slot->block_buf != VK_NULL_HANDLE) {
+                if (slot->block_mapped) vkUnmapMemory(vk->device, slot->block_mem);
+                vkDestroyBuffer(vk->device, slot->block_buf, NULL);
+                vkFreeMemory(vk->device, slot->block_mem, NULL);
+            }
+        }
+
         vkDestroyCommandPool(vk->device, vk->cmd_pool, NULL);
         vkDestroyDescriptorPool(vk->device, vk->desc_pool, NULL);
-        
+
         vkDestroyPipeline(vk->device, vk->pipe_idct, NULL);
         vkDestroyPipeline(vk->device, vk->pipe_mc, NULL);
         vkDestroyPipeline(vk->device, vk->pipe_intra, NULL);
         vkDestroyPipeline(vk->device, vk->pipe_loopfilter, NULL);
         vkDestroyPipelineLayout(vk->device, vk->pipe_layout, NULL);
-        
+
         if (vk->desc_layout_mc != VK_NULL_HANDLE) {
             vkDestroyDescriptorSetLayout(vk->device, vk->desc_layout_mc, NULL);
         }
         if (vk->desc_layout_buffer != VK_NULL_HANDLE) {
             vkDestroyDescriptorSetLayout(vk->device, vk->desc_layout_buffer, NULL);
-        }
-
-        if (vk->output_mapped) {
-            vkUnmapMemory(vk->device, vk->output_mem);
-        }
-        if (vk->output_buf) {
-            vkDestroyBuffer(vk->device, vk->output_buf, NULL);
-            vkFreeMemory(vk->device, vk->output_mem, NULL);
         }
 
         if (vk->above_buf != VK_NULL_HANDLE) {
@@ -700,21 +947,6 @@ void vulkan_backend_destroy(void *ctx)
         if (vk->left_buf != VK_NULL_HANDLE) {
             vkDestroyBuffer(vk->device, vk->left_buf, NULL);
             vkFreeMemory(vk->device, vk->left_mem, NULL);
-        }
-        if (vk->coeff_buf != VK_NULL_HANDLE) {
-            if (vk->coeff_mapped) vkUnmapMemory(vk->device, vk->coeff_mem);
-            vkDestroyBuffer(vk->device, vk->coeff_buf, NULL);
-            vkFreeMemory(vk->device, vk->coeff_mem, NULL);
-        }
-        if (vk->mv_buf != VK_NULL_HANDLE) {
-            if (vk->mv_mapped) vkUnmapMemory(vk->device, vk->mv_mem);
-            vkDestroyBuffer(vk->device, vk->mv_buf, NULL);
-            vkFreeMemory(vk->device, vk->mv_mem, NULL);
-        }
-        if (vk->block_buf != VK_NULL_HANDLE) {
-            if (vk->block_mapped) vkUnmapMemory(vk->device, vk->block_mem);
-            vkDestroyBuffer(vk->device, vk->block_buf, NULL);
-            vkFreeMemory(vk->device, vk->block_mem, NULL);
         }
 
         for (int i = 0; i < 8; i++) {
@@ -747,82 +979,79 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     vulkan_ctx_t *vk = (vulkan_ctx_t *)ctx;
     if (!vk || !pf) return CVP9_ERR_INVALID_DATA;
 
-    /* Wait for previous frame's command buffer to finish if it hasn't already */
-    if (vk->active_cmd != VK_NULL_HANDLE) {
-        VkResult fence_res = vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
-        if (fence_res != VK_SUCCESS) {
-            fprintf(stderr, "[compute-vp9] vkWaitForFences failed: %d\n", fence_res);
-            return CVP9_ERR_GPU;
-        }
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &vk->active_cmd);
-        vk->active_cmd = VK_NULL_HANDLE;
-    }    
+    /* Pipeline full: the caller must drain a frame with get_frame first */
+    if (vk->ring_count == CVP9_INFLIGHT) {
+        return CVP9_ERR_AGAIN;
+    }
+
     VkResult res = ensure_buffers(vk, pf->hdr.width, pf->hdr.height);
     if (res != VK_SUCCESS) {
         return CVP9_ERR_GPU;
     }
-    
-    vk->pts = pts;
-    vk->has_frame = 1;
+
+    /* Acquire the next free slot (never pending: ring_count < CVP9_INFLIGHT).
+     * Its buffers/descriptors are safe to touch while other slots decode. */
+    vk_frame_slot_t *slot = &vk->slots[(vk->ring_head + vk->ring_count) % CVP9_INFLIGHT];
+    slot->pts = pts;
 
     /* Upload coefficients (allocate only if size increases) */
     size_t coeff_size = pf->num_coeffs * sizeof(int16_t);
     if (coeff_size == 0) coeff_size = 256;
-    if (vk->coeff_buf_size < coeff_size) {
-        if (vk->coeff_buf != VK_NULL_HANDLE) {
-            vkUnmapMemory(vk->device, vk->coeff_mem);
-            vkDestroyBuffer(vk->device, vk->coeff_buf, NULL);
-            vkFreeMemory(vk->device, vk->coeff_mem, NULL);
+    if (slot->coeff_cap < coeff_size) {
+        if (slot->coeff_buf != VK_NULL_HANDLE) {
+            vkUnmapMemory(vk->device, slot->coeff_mem);
+            vkDestroyBuffer(vk->device, slot->coeff_buf, NULL);
+            vkFreeMemory(vk->device, slot->coeff_mem, NULL);
         }
         create_buffer(vk->device, vk->phys_device, coeff_size,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      &vk->coeff_buf, &vk->coeff_mem);
-        vk->coeff_buf_size = coeff_size;
-        vkMapMemory(vk->device, vk->coeff_mem, 0, coeff_size, 0, &vk->coeff_mapped);
+                      &slot->coeff_buf, &slot->coeff_mem);
+        slot->coeff_cap = coeff_size;
+        vkMapMemory(vk->device, slot->coeff_mem, 0, coeff_size, 0, &slot->coeff_mapped);
     }
-    if (pf->num_coeffs > 0 && vk->coeff_mapped) {
-        memcpy(vk->coeff_mapped, pf->coeffs, coeff_size);
+    if (pf->num_coeffs > 0 && slot->coeff_mapped) {
+        memcpy(slot->coeff_mapped, pf->coeffs, coeff_size);
     }
 
     /* Upload motion vectors (allocate only if size increases) */
     size_t mv_size = pf->mv_grid_width * pf->mv_grid_height * sizeof(cvp9_mv_t);
     if (mv_size == 0) mv_size = 256;
-    if (vk->mv_buf_size < mv_size) {
-        if (vk->mv_buf != VK_NULL_HANDLE) {
-            vkUnmapMemory(vk->device, vk->mv_mem);
-            vkDestroyBuffer(vk->device, vk->mv_buf, NULL);
-            vkFreeMemory(vk->device, vk->mv_mem, NULL);
+    if (slot->mv_cap < mv_size) {
+        if (slot->mv_buf != VK_NULL_HANDLE) {
+            vkUnmapMemory(vk->device, slot->mv_mem);
+            vkDestroyBuffer(vk->device, slot->mv_buf, NULL);
+            vkFreeMemory(vk->device, slot->mv_mem, NULL);
         }
         create_buffer(vk->device, vk->phys_device, mv_size,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      &vk->mv_buf, &vk->mv_mem);
-        vk->mv_buf_size = mv_size;
-        vkMapMemory(vk->device, vk->mv_mem, 0, mv_size, 0, &vk->mv_mapped);
+                      &slot->mv_buf, &slot->mv_mem);
+        slot->mv_cap = mv_size;
+        vkMapMemory(vk->device, slot->mv_mem, 0, mv_size, 0, &slot->mv_mapped);
     }
-    if (pf->mv_grid_width > 0 && pf->mv_grid_height > 0 && vk->mv_mapped) {
-        memcpy(vk->mv_mapped, pf->mv_grid, mv_size);
-    } 
+    if (pf->mv_grid_width > 0 && pf->mv_grid_height > 0 && slot->mv_mapped) {
+        memcpy(slot->mv_mapped, pf->mv_grid, mv_size);
+    }
 
     /* Batch Command Submission: Upload block data */
     size_t block_buf_size = pf->num_blocks * sizeof(gpu_block_data_t);
     if (block_buf_size == 0) block_buf_size = sizeof(gpu_block_data_t);
-    if (vk->block_buf_size < block_buf_size) {
-        if (vk->block_buf != VK_NULL_HANDLE) {
-            vkUnmapMemory(vk->device, vk->block_mem);
-            vkDestroyBuffer(vk->device, vk->block_buf, NULL);
-            vkFreeMemory(vk->device, vk->block_mem, NULL);
+    if (slot->block_cap < block_buf_size) {
+        if (slot->block_buf != VK_NULL_HANDLE) {
+            vkUnmapMemory(vk->device, slot->block_mem);
+            vkDestroyBuffer(vk->device, slot->block_buf, NULL);
+            vkFreeMemory(vk->device, slot->block_mem, NULL);
         }
         create_buffer(vk->device, vk->phys_device, block_buf_size,
                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      &vk->block_buf, &vk->block_mem);
-        vk->block_buf_size = block_buf_size;
-        vkMapMemory(vk->device, vk->block_mem, 0, block_buf_size, 0, &vk->block_mapped);
+                      &slot->block_buf, &slot->block_mem);
+        slot->block_cap = block_buf_size;
+        vkMapMemory(vk->device, slot->block_mem, 0, block_buf_size, 0, &slot->block_mapped);
     }
-    if (pf->num_blocks > 0 && vk->block_mapped) {
-        gpu_block_data_t *mapped = (gpu_block_data_t *)vk->block_mapped;
+    if (pf->num_blocks > 0 && slot->block_mapped) {
+        gpu_block_data_t *mapped = (gpu_block_data_t *)slot->block_mapped;
         for (uint32_t i = 0; i < pf->num_blocks; i++) {
             const vp9_macroblock_info_t *block = &pf->blocks[i];
             mapped[i].is_intra = block->is_intra;
@@ -840,38 +1069,42 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
         }
     }
 
-    /* Update descriptor sets once per frame */
-    bind_image_to_descriptor(vk->device, vk->desc_mc, 0, vk->ref_views[0], vk->ref_sampler);
-    bind_buffer_to_descriptor(vk->device, vk->desc_mc, 1, vk->dst_buf, vk->dst_size);
-    bind_buffer_to_descriptor(vk->device, vk->desc_mc, 2, vk->mv_buf, mv_size);
+    /* Update this slot's descriptor sets (slot is idle, safe to write) */
+    bind_image_to_descriptor(vk->device, slot->desc_mc, 0, vk->ref_views[0], vk->ref_sampler);
+    bind_buffer_to_descriptor(vk->device, slot->desc_mc, 1, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, slot->desc_mc, 2, slot->mv_buf, mv_size);
 
-    bind_buffer_to_descriptor(vk->device, vk->desc_intra, 0, vk->dst_buf, vk->dst_size);
-    bind_buffer_to_descriptor(vk->device, vk->desc_intra, 1, vk->dst_buf, vk->dst_size);
-    bind_buffer_to_descriptor(vk->device, vk->desc_intra, 2, vk->block_buf, block_buf_size);
+    bind_buffer_to_descriptor(vk->device, slot->desc_intra, 0, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, slot->desc_intra, 1, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, slot->desc_intra, 2, slot->block_buf, block_buf_size);
 
-    bind_buffer_to_descriptor(vk->device, vk->desc_idct, 0, vk->coeff_buf, coeff_size);
-    bind_buffer_to_descriptor(vk->device, vk->desc_idct, 1, vk->dst_buf, vk->dst_size);
-    bind_buffer_to_descriptor(vk->device, vk->desc_idct, 2, vk->block_buf, block_buf_size);
+    bind_buffer_to_descriptor(vk->device, slot->desc_idct, 0, slot->coeff_buf, coeff_size);
+    bind_buffer_to_descriptor(vk->device, slot->desc_idct, 1, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, slot->desc_idct, 2, slot->block_buf, block_buf_size);
 
-    bind_buffer_to_descriptor(vk->device, vk->desc_lf, 0, vk->dst_buf, vk->dst_size);
-    bind_buffer_to_descriptor(vk->device, vk->desc_lf, 1, vk->dst_buf, vk->dst_size);
-    bind_buffer_to_descriptor(vk->device, vk->desc_lf, 2, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, slot->desc_lf, 0, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, slot->desc_lf, 1, vk->dst_buf, vk->dst_size);
+    bind_buffer_to_descriptor(vk->device, slot->desc_lf, 2, vk->dst_buf, vk->dst_size);
 
-    /* Record command buffer */
-    VkCommandBufferAllocateInfo cmd_alloc = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = vk->cmd_pool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1
-    };
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(vk->device, &cmd_alloc, &cmd);
-    
+    /* Record into the slot's persistent command buffer (implicit reset) */
+    VkCommandBuffer cmd = slot->cmd;
+
     VkCommandBufferBeginInfo begin_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
     };
     vkBeginCommandBuffer(cmd, &begin_info);
+
+    /* Cross-frame hazard: the previous frame's command buffer still reads
+     * dst_buf (copy-out) when this one starts writing it. Same queue, so an
+     * execution barrier at the boundary is sufficient (WAR). */
+    VkMemoryBarrier war_barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = 0,
+        .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &war_barrier, 0, NULL, 0, NULL);
 
     VkMemoryBarrier mem_barrier = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -892,7 +1125,7 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
         .filter_type = 0
     };
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_mc);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_mc, 0, NULL);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &slot->desc_mc, 0, NULL);
     vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_mc), &pc_mc);
     vkCmdDispatch(cmd, (vk->width + 7) / 8, (vk->height + 7) / 8, 1);
 
@@ -903,7 +1136,7 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     if (pf->num_blocks > 0) {
         /* Dispatch all Intra Prediction blocks */
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_intra);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_intra, 0, NULL);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &slot->desc_intra, 0, NULL);
         vkCmdDispatch(cmd, pf->num_blocks, 1, 1);
 
         /* Barrier to ensure Intra finishes before IDCT adds residual */
@@ -912,7 +1145,7 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
 
         /* Dispatch all IDCT/Residual blocks */
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_idct);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_idct, 0, NULL);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &slot->desc_idct, 0, NULL);
         vkCmdDispatch(cmd, pf->num_blocks, 1, 1);
         
         /* Barrier to ensure IDCT writes complete before Loop Filter */
@@ -938,17 +1171,22 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     };
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_loopfilter);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &vk->desc_lf, 0, NULL);
-    
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &slot->desc_lf, 0, NULL);
+
+    /* 2D dispatch: one thread per (pixel, 8px-boundary) pair instead of a
+     * single row of workgroups looping over the whole frame */
+    uint32_t h_boundaries = (vk->height > 8) ? (vk->height - 1) / 8 : 0;
+    uint32_t v_boundaries = (vk->width > 8) ? (vk->width - 1) / 8 : 0;
+
     vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_lf), &pc_lf);
-    vkCmdDispatch(cmd, (vk->width + 7) / 8, 1, 1);
+    vkCmdDispatch(cmd, (vk->width + 7) / 8, (h_boundaries + 7) / 8, 1);
 
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &mem_barrier, 0, NULL, 0, NULL);
 
     pc_lf.pass = 1;
     vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_lf), &pc_lf);
-    vkCmdDispatch(cmd, (vk->height + 7) / 8, 1, 1);
+    vkCmdDispatch(cmd, (vk->height + 7) / 8, (v_boundaries + 7) / 8, 1);
 
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &mem_barrier, 0, NULL, 0, NULL);
@@ -962,13 +1200,13 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 1, &transfer_barrier, 0, NULL, 0, NULL);
 
-    /* Copy destination back to staging output buffer */
+    /* Copy destination back to this slot's output buffer */
     VkBufferCopy copy_region = {
         .srcOffset = 0,
         .dstOffset = 0,
         .size = vk->dst_size
     };
-    vkCmdCopyBuffer(cmd, vk->dst_buf, vk->output_buf, 1, &copy_region);
+    vkCmdCopyBuffer(cmd, vk->dst_buf, slot->output_buf, 1, &copy_region);
 
     /* Update Reference frame slot 0 for subsequent inter frames */
     /* Transition ref_image to TRANSFER_DST */
@@ -1022,76 +1260,165 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
 
     vkEndCommandBuffer(cmd);
 
-    /* Submit asynchronously */
+    /* Submit asynchronously — the caller keeps parsing the next frame on the
+     * CPU while the GPU reconstructs this one */
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
         .pCommandBuffers = &cmd
     };
-    
-    vkResetFences(vk->device, 1, &vk->fence);
-    VkResult queue_res = vkQueueSubmit(vk->compute_queue, 1, &submit_info, vk->fence);
+
+    vkResetFences(vk->device, 1, &slot->fence);
+    VkResult queue_res = vkQueueSubmit(vk->compute_queue, 1, &submit_info, slot->fence);
     if (queue_res != VK_SUCCESS) {
         fprintf(stderr, "[compute-vp9] vkQueueSubmit failed: %d\n", queue_res);
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &cmd);
         return CVP9_ERR_GPU;
     }
-    
-    vk->active_cmd = cmd;
+
+    slot->pending = 1;
+    vk->ring_count++;
     return CVP9_OK;
 }
 
-cvp9_err_t vulkan_get_frame(void *ctx, cvp9_frame_info_t *info)
+/* Wait for (or poll) the oldest in-flight frame. On success the slot is
+ * released from the ring but its output buffer stays valid until the slot
+ * is reused, CVP9_INFLIGHT-1 decodes later. */
+static cvp9_err_t acquire_oldest_frame(vulkan_ctx_t *vk, int wait, vk_frame_slot_t **out_slot)
 {
-    vulkan_ctx_t *vk = (vulkan_ctx_t *)ctx;
-    if (!vk || !vk->has_frame) return CVP9_ERR_UNSUPPORTED;
-    
-    /* Synchronize and clean up the active command buffer */
-    if (vk->active_cmd != VK_NULL_HANDLE) {
-        VkResult fence_res = vkWaitForFences(vk->device, 1, &vk->fence, VK_TRUE, UINT64_MAX);
+    if (!vk || vk->ring_count == 0) return CVP9_ERR_UNSUPPORTED;
+
+    vk_frame_slot_t *slot = &vk->slots[vk->ring_head];
+
+    /* Opportunistic mode: only deliver if the GPU already finished, unless
+     * the pipeline is full (then block to guarantee forward progress) */
+    if (!wait && vk->ring_count < CVP9_INFLIGHT) {
+        if (vkGetFenceStatus(vk->device, slot->fence) != VK_SUCCESS) {
+            return CVP9_ERR_AGAIN;
+        }
+    } else {
+        VkResult fence_res = vkWaitForFences(vk->device, 1, &slot->fence, VK_TRUE, UINT64_MAX);
         if (fence_res != VK_SUCCESS) {
             fprintf(stderr, "[compute-vp9] vkWaitForFences in get_frame failed: %d\n", fence_res);
             return CVP9_ERR_GPU;
         }
-        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &vk->active_cmd);
-        vk->active_cmd = VK_NULL_HANDLE;
     }
 
-    cvp9_frame_alloc(info, vk->width, vk->height);
-    info->pts = vk->pts;
+    slot->pending = 0;
+    vk->ring_head = (vk->ring_head + 1) % CVP9_INFLIGHT;
+    vk->ring_count--;
 
-    /* Invalidate host cache since output buffer is HOST_CACHED but not coherent */
+    /* Invalidate host cache since output memory may be HOST_CACHED, non-coherent */
     VkMappedMemoryRange invalidate_range = {
         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-        .memory = vk->output_mem,
+        .memory = slot->output_mem,
         .offset = 0,
         .size = VK_WHOLE_SIZE
     };
     vkInvalidateMappedMemoryRanges(vk->device, 1, &invalidate_range);
-    
-    uint8_t *src = vk->output_mapped;
+
+    *out_slot = slot;
+    return CVP9_OK;
+}
+
+cvp9_err_t vulkan_get_frame(void *ctx, cvp9_frame_info_t *info, int wait)
+{
+    vulkan_ctx_t *vk = (vulkan_ctx_t *)ctx;
+    vk_frame_slot_t *slot = NULL;
+
+    cvp9_err_t err = acquire_oldest_frame(vk, wait, &slot);
+    if (err != CVP9_OK) return err;
+
+    /* Zero-copy: hand out pointers into the persistently mapped output
+     * buffer. Valid until this slot is reused (CVP9_INFLIGHT-1 decodes). */
     uint32_t w = vk->width;
     uint32_t h = vk->height;
     uint32_t size_y = w * h;
-    uint32_t size_uv = ((w + 1) / 2) * ((h + 1) / 2);
-    
-    /* Copy Y plane */
-    for (uint32_t r = 0; r < h; r++) {
-        memcpy(info->plane_y + r * info->stride_y, src + r * w, w);
-    }
-    /* Copy U plane */
-    uint32_t ch = (h + 1) / 2;
     uint32_t cw = (w + 1) / 2;
-    for (uint32_t r = 0; r < ch; r++) {
-        memcpy(info->plane_u + r * info->stride_uv, src + size_y + r * cw, cw);
-    }
-    /* Copy V plane */
-    for (uint32_t r = 0; r < ch; r++) {
-        memcpy(info->plane_v + r * info->stride_uv, src + size_y + size_uv + r * cw, cw);
-    }
-    
-    vk->has_frame = 0;
+    uint32_t ch = (h + 1) / 2;
+    uint8_t *base = slot->output_mapped;
+
+    info->width = w;
+    info->height = h;
+    info->stride_y = w;
+    info->stride_uv = cw;
+    info->plane_y = base;
+    info->plane_u = base + size_y;
+    info->plane_v = base + size_y + cw * ch;
+    info->pts = slot->pts;
+
     return CVP9_OK;
+}
+
+cvp9_err_t vulkan_get_frame_dmabuf(void *ctx, cvp9_dmabuf_frame_t *out)
+{
+    vulkan_ctx_t *vk = (vulkan_ctx_t *)ctx;
+    if (!vk || !vk->ext_dmabuf) return CVP9_ERR_UNSUPPORTED;
+
+    vk_frame_slot_t *slot = NULL;
+    cvp9_err_t err = acquire_oldest_frame(vk, 1, &slot);
+    if (err != CVP9_OK) return err;
+    if (slot->dmabuf_fd < 0) return CVP9_ERR_UNSUPPORTED;
+
+    uint32_t w = vk->width;
+    uint32_t h = vk->height;
+    uint32_t cw = (w + 1) / 2;
+    uint32_t ch = (h + 1) / 2;
+
+    out->fd = dup(slot->dmabuf_fd);
+    if (out->fd < 0) return CVP9_ERR_GPU;
+    out->size = vk->output_size;
+    out->width = w;
+    out->height = h;
+    out->offsets[0] = 0;
+    out->offsets[1] = w * h;
+    out->offsets[2] = w * h + cw * ch;
+    out->pitches[0] = w;
+    out->pitches[1] = cw;
+    out->pitches[2] = cw;
+    out->pts = slot->pts;
+
+    return CVP9_OK;
+}
+
+cvp9_err_t vulkan_export_buffer_alloc(void *ctx, uint64_t size, cvp9_export_buffer_t *out)
+{
+    vulkan_ctx_t *vk = (vulkan_ctx_t *)ctx;
+    if (!vk || !out) return CVP9_ERR_INVALID_DATA;
+    if (!vk->ext_dmabuf) return CVP9_ERR_UNSUPPORTED;
+
+    VkBuffer buf;
+    VkDeviceMemory mem;
+    void *mapped;
+    int fd;
+    VkResult res = create_exportable_buffer(vk, size,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            &buf, &mem, &mapped, &fd);
+    if (res != VK_SUCCESS) return CVP9_ERR_GPU;
+    if (fd < 0) {
+        vkUnmapMemory(vk->device, mem);
+        vkDestroyBuffer(vk->device, buf, NULL);
+        vkFreeMemory(vk->device, mem, NULL);
+        return CVP9_ERR_UNSUPPORTED;
+    }
+
+    out->fd = fd;
+    out->mapped = mapped;
+    out->size = size;
+    out->priv_buf = (void *)buf;
+    out->priv_mem = (void *)mem;
+    return CVP9_OK;
+}
+
+void vulkan_export_buffer_free(void *ctx, cvp9_export_buffer_t *b)
+{
+    vulkan_ctx_t *vk = (vulkan_ctx_t *)ctx;
+    if (!vk || !b || !b->priv_buf) return;
+    vkUnmapMemory(vk->device, (VkDeviceMemory)b->priv_mem);
+    vkDestroyBuffer(vk->device, (VkBuffer)b->priv_buf, NULL);
+    vkFreeMemory(vk->device, (VkDeviceMemory)b->priv_mem, NULL);
+    if (b->fd >= 0) close(b->fd);
+    memset(b, 0, sizeof(*b));
+    b->fd = -1;
 }
 
 #endif /* ENABLE_VULKAN */

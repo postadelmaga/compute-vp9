@@ -20,11 +20,23 @@ option(ENABLE_DOCS    "Build documentation"             OFF)
 # ─── Dependencies ───────────────────────────────────────────────────────────
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
+include(GNUInstallDirs)
 find_package(PkgConfig REQUIRED)
 
 if(ENABLE_VAAPI)
     pkg_check_modules(LIBVA REQUIRED libva)
     pkg_check_modules(LIBVA_DRM REQUIRED libva-drm)
+
+    # VA-API driver plugins must live where libva actually looks for them
+    # (its "driverdir", e.g. /usr/lib/dri), not under our install prefix.
+    set(CVP9_VA_DRIVER_DIR "" CACHE PATH "Install dir for the VA-API driver plugin (default: libva driverdir)")
+    if(NOT CVP9_VA_DRIVER_DIR)
+        pkg_get_variable(CVP9_VA_DRIVER_DIR libva driverdir)
+    endif()
+    if(NOT CVP9_VA_DRIVER_DIR)
+        set(CVP9_VA_DRIVER_DIR "${CMAKE_INSTALL_FULL_LIBDIR}/dri")
+    endif()
+    message(STATUS "VA-API driver install dir: ${CVP9_VA_DRIVER_DIR}")
 endif()
 
 if(ENABLE_VULKAN)
@@ -57,6 +69,7 @@ target_include_directories(compute_vp9
 target_link_libraries(compute_vp9 PRIVATE m)
 
 # ─── Shader compilation (after target exists) ────────────────────────────────
+set(CVP9_SHADER_INSTALL_DIR "${CMAKE_INSTALL_FULL_DATADIR}/compute-vp9/shaders")
 if(ENABLE_VULKAN AND GLSLC)
     include(cmake/CompileShaders.cmake)
     compile_shaders(VP9_SHADERS
@@ -66,6 +79,13 @@ if(ENABLE_VULKAN AND GLSLC)
         shaders/vp9_loopfilter.comp.glsl
     )
     add_dependencies(compute_vp9 VP9_SHADERS)
+
+    # Installed runs load the SPIR-V from the system data dir
+    target_compile_definitions(compute_vp9 PRIVATE
+        "CVP9_SHADER_INSTALL_DIR=\"${CVP9_SHADER_INSTALL_DIR}\"")
+    install(DIRECTORY ${CMAKE_BINARY_DIR}/shaders/
+        DESTINATION ${CVP9_SHADER_INSTALL_DIR}
+        FILES_MATCHING PATTERN "*.spv")
 endif()
 
 if(ENABLE_VULKAN)
@@ -115,7 +135,7 @@ if(ENABLE_VAAPI)
         OUTPUT_NAME "compute_vp9_drv_video"
     )
     install(TARGETS compute_vp9_drv_video
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/dri
+        LIBRARY DESTINATION ${CVP9_VA_DRIVER_DIR}
     )
 endif()
 
@@ -126,7 +146,6 @@ if(ENABLE_TESTS)
 endif()
 
 # ─── Install ────────────────────────────────────────────────────────────────
-include(GNUInstallDirs)
 install(TARGETS compute_vp9
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
