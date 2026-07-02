@@ -158,7 +158,7 @@ int test_keyframe_decode(void)
     printf("=== test_keyframe_decode ===\n");
 
     /* Construct a minimal valid VP9 keyframe packet (conformant header) */
-    uint8_t packet[1024];
+    uint8_t packet[4096];
     size_t packet_size = vp9_synth_keyframe(packet, 128, 128, 0);
 
     cvp9_ctx_t *ctx = NULL;
@@ -195,7 +195,7 @@ int test_keyframe_decode_vulkan(void)
     printf("=== test_keyframe_decode_vulkan ===\n");
 
     /* Construct a minimal valid VP9 keyframe packet (conformant header) */
-    uint8_t packet[1024];
+    uint8_t packet[4096];
     size_t packet_size = vp9_synth_keyframe(packet, 128, 128, 0);
 
     cvp9_ctx_t *ctx = NULL;

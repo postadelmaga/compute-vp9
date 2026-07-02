@@ -67,9 +67,26 @@ static void synth_write_tile_info(vp9_synth_bw_t *bw, uint32_t width, int log2_t
     synth_write_bit(bw, 0);  /* log2_tile_rows = 0 */
 }
 
+/* Zero-filled tile payload sized so an all-zeros conformant decode (every
+ * bool reads 0: NONE partitions, DC modes, immediate EOBs) stays inside the
+ * buffer: ~18 bytes per 64x64 superblock, padded generously. */
+static size_t synth_tile_payload(uint32_t width, uint32_t height, int log2_tile_cols)
+{
+    size_t sb_cols = ((width + 63) / 64 >> log2_tile_cols) + 1;
+    size_t sb_rows = (height + 63) / 64;
+    return 64 + sb_cols * sb_rows * 32;
+}
+
+/* Buffer size needed for a synthetic packet */
+static size_t vp9_synth_bufsize(uint32_t width, uint32_t height)
+{
+    return 4096 + ((size_t)(width + 63) / 64) * ((height + 63) / 64) * 40;
+}
+
 /* Common tail: frame context, loop filter, quant, segmentation, tiles,
  * header_size, dummy compressed header, zero tile payloads */
-static void synth_write_tail(vp9_synth_bw_t *bw, uint32_t width, int log2_tile_cols)
+static void synth_write_tail(vp9_synth_bw_t *bw, uint32_t width, uint32_t height,
+                             int log2_tile_cols)
 {
     synth_write_bit(bw, 0);        /* refresh_frame_context */
     synth_write_bit(bw, 0);        /* frame_parallel_decoding_mode */
@@ -101,15 +118,16 @@ static void synth_write_tail(vp9_synth_bw_t *bw, uint32_t width, int log2_tile_c
 
     /* Tile payloads: non-last tiles carry a 4-byte size header */
     int tiles = 1 << log2_tile_cols;
+    size_t payload = synth_tile_payload(width, height, log2_tile_cols);
     for (int t = 0; t < tiles; t++) {
         if (t != tiles - 1) {
-            bw->buf[bw->pos++] = 0x00;
-            bw->buf[bw->pos++] = 0x00;
-            bw->buf[bw->pos++] = 0x00;
-            bw->buf[bw->pos++] = 64;
+            bw->buf[bw->pos++] = (uint8_t)(payload >> 24);
+            bw->buf[bw->pos++] = (uint8_t)(payload >> 16);
+            bw->buf[bw->pos++] = (uint8_t)(payload >> 8);
+            bw->buf[bw->pos++] = (uint8_t)payload;
         }
-        memset(bw->buf + bw->pos, 0, 64);
-        bw->pos += 64;
+        memset(bw->buf + bw->pos, 0, payload);
+        bw->pos += payload;
     }
 }
 
@@ -137,7 +155,7 @@ static size_t vp9_synth_keyframe(uint8_t *buf, uint32_t width, uint32_t height,
     synth_write_bits(&bw, height - 1, 16);
     synth_write_bit(&bw, 0);       /* render_and_frame_size_different */
 
-    synth_write_tail(&bw, width, log2_tile_cols);
+    synth_write_tail(&bw, width, height, log2_tile_cols);
     return bw.pos;
 }
 
@@ -174,6 +192,6 @@ static size_t vp9_synth_interframe(uint8_t *buf, uint32_t width, uint32_t height
     synth_write_bit(&bw, 0);       /* is_filter_switchable */
     synth_write_bits(&bw, 1, 2);   /* literal 1 = EIGHTTAP */
 
-    synth_write_tail(&bw, width, log2_tile_cols);
+    synth_write_tail(&bw, width, height, log2_tile_cols);
     return bw.pos;
 }

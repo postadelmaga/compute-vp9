@@ -55,8 +55,9 @@ int main(int argc, char **argv)
         printf("Resolution: %dx%d | Frames: %d\n\n", width, height, BENCHMARK_FRAMES);
     }
 
-    uint8_t *keyframe_buf = malloc(1024);
-    uint8_t *interframe_buf = malloc(1024);
+    size_t synth_bufsize = vp9_synth_bufsize(width, height);
+    uint8_t *keyframe_buf = malloc(synth_bufsize);
+    uint8_t *interframe_buf = malloc(synth_bufsize);
     if (!keyframe_buf || !interframe_buf) {
         printf("ERROR: Out of memory allocating packet buffers\n");
         free(keyframe_buf);
