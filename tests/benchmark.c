@@ -11,6 +11,7 @@
 #include "compute_vp9/decoder.h"
 #include "../src/decoder/vp9_bitstream.h"
 #include "../src/decoder/vp9_parsed_frame.h"
+#include "vp9_synth.h"
 
 #define BENCHMARK_FRAMES 100
 #define FRAME_WIDTH 1280
@@ -22,156 +23,6 @@ static double get_time_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
-}
-
-typedef struct {
-    uint8_t *buf;
-    size_t pos;
-    int bit;
-} bitwriter_t;
-
-static void write_bit(bitwriter_t *bw, int bit) {
-    if (bw->bit < 0) {
-        bw->bit = 7;
-        bw->pos++;
-    }
-    if (bit) {
-        bw->buf[bw->pos] |= (1 << bw->bit);
-    } else {
-        bw->buf[bw->pos] &= ~(1 << bw->bit);
-    }
-    bw->bit--;
-}
-
-static void write_bits(bitwriter_t *bw, uint32_t val, int n) {
-    for (int i = n - 1; i >= 0; i--) {
-        write_bit(bw, (val >> i) & 1);
-    }
-}
-
-static void align_byte(bitwriter_t *bw) {
-    if (bw->bit < 7) {
-        bw->bit = 7;
-        bw->pos++;
-    }
-}
-
-/* Append tile payload: with N>1 tile columns, non-last tiles carry a 4-byte
- * big-endian size header, the last tile takes the remaining bytes */
-static void write_tiles(bitwriter_t *bw, int log2_tile_cols)
-{
-    int tiles = 1 << log2_tile_cols;
-    for (int t = 0; t < tiles; t++) {
-        if (t != tiles - 1) {
-            bw->buf[bw->pos++] = 0x00;
-            bw->buf[bw->pos++] = 0x00;
-            bw->buf[bw->pos++] = 0x00;
-            bw->buf[bw->pos++] = 64;
-        }
-        memset(bw->buf + bw->pos, 0, 64);
-        bw->pos += 64;
-    }
-}
-
-/* Generates a synthetic VP9 keyframe packet matching our parser's dialect */
-static size_t generate_synthetic_keyframe(uint8_t *buf, uint32_t width, uint32_t height,
-                                          int log2_tile_cols)
-{
-    memset(buf, 0, 1024);
-    bitwriter_t bw = { .buf = buf, .pos = 0, .bit = 7 };
-
-    write_bits(&bw, 2, 2); /* frame_marker */
-    write_bits(&bw, 0, 2); /* profile */
-    write_bit(&bw, 0);     /* show_existing_frame */
-    write_bit(&bw, 0);     /* frame_type (KEY) */
-    write_bit(&bw, 1);     /* show_frame */
-    write_bit(&bw, 0);     /* error_resilient */
-
-    write_bits(&bw, 0x498342, 24); /* sync_code */
-    write_bits(&bw, 1, 3);          /* color_space = BT601 */
-
-    write_bits(&bw, width - 1, 16);
-    write_bits(&bw, height - 1, 16);
-
-    write_bits(&bw, 128, 8); /* base_qindex */
-    write_bit(&bw, 0);       /* y_dc_delta_q */
-    write_bit(&bw, 0);       /* uv_dc_delta_q */
-    write_bit(&bw, 0);       /* uv_ac_delta_q */
-
-    write_bits(&bw, 32, 6);  /* filter_level */
-    write_bits(&bw, 0, 3);   /* sharpness_level */
-
-    for (int i = 0; i < log2_tile_cols; i++) write_bit(&bw, 1);
-    write_bit(&bw, 0);       /* log2_tile_cols terminator */
-    write_bit(&bw, 0);       /* log2_tile_rows */
-
-    align_byte(&bw);
-
-    /* Write 16-bit compressed header size (big-endian) */
-    size_t size_pos = bw.pos;
-    buf[size_pos] = 0x00;
-    buf[size_pos + 1] = 0x04;
-    bw.pos += 2;
-
-    /* Write compressed header payload (4 bytes of zeros) */
-    buf[bw.pos++] = 0x00;
-    buf[bw.pos++] = 0x00;
-    buf[bw.pos++] = 0x00;
-    buf[bw.pos++] = 0x00;
-
-    write_tiles(&bw, log2_tile_cols);
-
-    return bw.pos;
-}
-
-/* Generates a synthetic VP9 interframe packet */
-static size_t generate_synthetic_interframe(uint8_t *buf, uint32_t width, uint32_t height,
-                                            int log2_tile_cols)
-{
-    memset(buf, 0, 1024);
-    bitwriter_t bw = { .buf = buf, .pos = 0, .bit = 7 };
-
-    write_bits(&bw, 2, 2); /* frame_marker */
-    write_bits(&bw, 0, 2); /* profile */
-    write_bit(&bw, 0);     /* show_existing_frame */
-    write_bit(&bw, 1);     /* frame_type (NON-KEY) */
-    write_bit(&bw, 1);     /* show_frame */
-    write_bit(&bw, 0);     /* error_resilient */
-
-    write_bits(&bw, 0x01, 8); /* refresh_frame_flags: slot 0 */
-    write_bits(&bw, 0, 3);    /* ref_frame_idx[0] (LAST) */
-    write_bits(&bw, 0, 3);    /* ref_frame_idx[1] (GOLDEN) */
-    write_bits(&bw, 0, 3);    /* ref_frame_idx[2] (ALTREF) */
-
-    write_bits(&bw, 128, 8); /* base_qindex */
-    write_bit(&bw, 0);       /* y_dc_delta_q */
-    write_bit(&bw, 0);       /* uv_dc_delta_q */
-    write_bit(&bw, 0);       /* uv_ac_delta_q */
-
-    write_bits(&bw, 32, 6);  /* filter_level */
-    write_bits(&bw, 0, 3);   /* sharpness_level */
-
-    for (int i = 0; i < log2_tile_cols; i++) write_bit(&bw, 1);
-    write_bit(&bw, 0);       /* log2_tile_cols terminator */
-    write_bit(&bw, 0);       /* log2_tile_rows */
-
-    align_byte(&bw);
-
-    /* Write 16-bit compressed header size (big-endian) */
-    size_t size_pos = bw.pos;
-    buf[size_pos] = 0x00;
-    buf[size_pos + 1] = 0x04;
-    bw.pos += 2;
-
-    /* Write compressed header payload (4 bytes of zeros) */
-    buf[bw.pos++] = 0x00;
-    buf[bw.pos++] = 0x00;
-    buf[bw.pos++] = 0x00;
-    buf[bw.pos++] = 0x00;
-
-    write_tiles(&bw, log2_tile_cols);
-
-    return bw.pos;
 }
 
 int main(int argc, char **argv)
@@ -213,8 +64,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    size_t keyframe_size = generate_synthetic_keyframe(keyframe_buf, width, height, log2_tile_cols);
-    size_t interframe_size = generate_synthetic_interframe(interframe_buf, width, height, log2_tile_cols);
+    size_t keyframe_size = vp9_synth_keyframe(keyframe_buf, width, height, log2_tile_cols);
+    size_t interframe_size = vp9_synth_interframe(interframe_buf, width, height, log2_tile_cols);
     if (log2_tile_cols > 0) {
         printf("Tile columns: %d (parsed in parallel)\n", 1 << log2_tile_cols);
     }

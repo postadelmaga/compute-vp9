@@ -118,10 +118,15 @@ cvp9_err_t cvp9_decode(cvp9_ctx_t *ctx,
     vp9_bitreader_t br;
     vp9_bitreader_init(&br, data, size);
 
-    int rc = vp9_parse_frame_header(&br, &ctx->last_frame_hdr);
+    int rc = vp9_parse_frame_header(&br, &ctx->last_frame_hdr, ctx->width, ctx->height);
     if (rc != 0) return CVP9_ERR_INVALID_DATA;
 
     vp9_frame_header_t *hdr = &ctx->last_frame_hdr;
+
+    if (hdr->show_existing_frame) {
+        /* Frame repeat: nothing to decode (redisplay not implemented yet) */
+        return CVP9_OK;
+    }
 
     if (hdr->width > 0 && hdr->height > 0) {
         ctx->width = hdr->width;
@@ -141,17 +146,12 @@ cvp9_err_t cvp9_decode(cvp9_ctx_t *ctx,
         vp9_entropy_probs_init(&ctx->probs);
     }
 
-    /* 2. Determine compressed header and tile locations */
-    size_t header_start_pos = br.pos;
-    if (br.bit < 7) header_start_pos++;
-    if (header_start_pos + 2 > size) return CVP9_ERR_INVALID_DATA;
-    
-    uint32_t header_size = ((uint32_t)data[header_start_pos] << 8) | data[header_start_pos + 1];
-    size_t comp_header_start = header_start_pos + 2;
-    if (comp_header_start + header_size > size) return CVP9_ERR_INVALID_DATA;
-    
-    const uint8_t *tile_data = data + comp_header_start + header_size;
-    size_t tile_size = size - comp_header_start - header_size;
+    /* 2. Tile data follows the uncompressed + compressed headers */
+    size_t tile_offset = (size_t)hdr->uncompressed_header_bytes + hdr->first_partition_size;
+    if (tile_offset >= size) return CVP9_ERR_INVALID_DATA;
+
+    const uint8_t *tile_data = data + tile_offset;
+    size_t tile_size = size - tile_offset;
 
     /* 3. Parse tiles and macroblocks/coefficients */
     int parse_rc = vp9_decode_tiles(hdr, tile_data, tile_size, &ctx->probs, ctx->parsed_frame);
@@ -354,13 +354,18 @@ cvp9_err_t cvp9_decode_vaapi(cvp9_ctx_t *ctx,
         : (uint8_t)(1u << (pic_param->pic_fields.bits.last_ref_frame & 7));
 
     /* base_qindex is not part of the VA-API picture parameters — it lives in
-     * the uncompressed frame header, so parse it from the bitstream */
+     * the uncompressed frame header, so parse it from the bitstream. The
+     * parse also yields the exact tile data offset. */
+    size_t parsed_tile_offset = 0;
     {
         vp9_bitreader_t br;
         vp9_frame_header_t parsed;
         vp9_bitreader_init(&br, data, size);
-        if (vp9_parse_frame_header(&br, &parsed) == 0) {
+        if (vp9_parse_frame_header(&br, &parsed, hdr->width, hdr->height) == 0 &&
+            !parsed.show_existing_frame) {
             hdr->base_qindex = parsed.base_qindex;
+            parsed_tile_offset = (size_t)parsed.uncompressed_header_bytes +
+                                 parsed.first_partition_size;
         }
     }
 
@@ -374,8 +379,14 @@ cvp9_err_t cvp9_decode_vaapi(cvp9_ctx_t *ctx,
         vp9_entropy_probs_init(&ctx->probs);
     }
 
-    /* 3. Parse tiles from the bitstream using the range coder/entropy parser */
-    size_t tile_data_offset = slice_param->slice_data_offset + pic_param->first_partition_size;
+    /* 3. Parse tiles from the bitstream using the range coder/entropy parser.
+     * Prefer the offset computed by our own header parse; fall back to the
+     * VA-provided header lengths. */
+    size_t tile_data_offset = parsed_tile_offset;
+    if (tile_data_offset == 0) {
+        tile_data_offset = pic_param->frame_header_length_in_bytes +
+                           pic_param->first_partition_size;
+    }
     if (tile_data_offset >= size) {
         tile_data_offset = 0;
     }

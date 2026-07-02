@@ -2,6 +2,7 @@
 #include <string.h>
 #include <assert.h>
 #include "compute_vp9/decoder.h"
+#include "vp9_synth.h"
 #include "../src/decoder/vp9_bitstream.h"
 #include "../src/decoder/vpx_reader.h"
 #include "../src/decoder/vp9_parsed_frame.h"
@@ -87,7 +88,7 @@ int test_frame_header(void)
     vp9_bitreader_t br;
     vp9_bitreader_init(&br, fake_key, sizeof(fake_key));
     vp9_frame_header_t hdr;
-    int rc = vp9_parse_frame_header(&br, &hdr);
+    int rc = vp9_parse_frame_header(&br, &hdr, 0, 0);
 
     /* We allow parse errors on synthetic data — just check no crash */
     printf("  parse returned: %d (frame_type=%d)\n", rc, hdr.frame_type);
@@ -156,30 +157,16 @@ int test_keyframe_decode(void)
 {
     printf("=== test_keyframe_decode ===\n");
 
-    /* Construct a minimal valid VP9 keyframe package */
-    uint8_t packet[] = {
-        0x82,               /* marker, profile, keyframe, show_frame, etc. */
-        0x49, 0x83, 0x42,  /* sync code */
-        0x00, 0x0F, 0xE0, 0x0F, 0xF0, 0x00, 0x00, 0x00, /* width, height, qindex, delta q, filter, tiles */
-        
-        /* Compressed header size (16-bit) = 4 */
-        0x00, 0x04,
-        /* Compressed header (4 bytes) */
-        0x00, 0x00, 0x00, 0x00,
-        
-        /* Tile data (zeros) */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    };
+    /* Construct a minimal valid VP9 keyframe packet (conformant header) */
+    uint8_t packet[1024];
+    size_t packet_size = vp9_synth_keyframe(packet, 128, 128, 0);
 
     cvp9_ctx_t *ctx = NULL;
     cvp9_config_t cfg = { .backend = CVP9_BACKEND_CPU };
     cvp9_err_t err = cvp9_create(&cfg, &ctx);
     if (err != CVP9_OK) FAIL("cvp9_create", cvp9_err_str(err));
 
-    err = cvp9_decode(ctx, packet, sizeof(packet), 12345);
+    err = cvp9_decode(ctx, packet, packet_size, 12345);
     if (err != CVP9_OK) FAIL("cvp9_decode", cvp9_err_str(err));
 
     cvp9_frame_info_t frame;
@@ -207,30 +194,16 @@ int test_keyframe_decode_vulkan(void)
 #else
     printf("=== test_keyframe_decode_vulkan ===\n");
 
-    /* Construct a minimal valid VP9 keyframe package */
-    uint8_t packet[] = {
-        0x82,               /* marker, profile, keyframe, show_frame, etc. */
-        0x49, 0x83, 0x42,  /* sync code */
-        0x00, 0x0F, 0xE0, 0x0F, 0xF0, 0x00, 0x00, 0x00, /* width, height, qindex, delta q, filter, tiles */
-        
-        /* Compressed header size (16-bit) = 4 */
-        0x00, 0x04,
-        /* Compressed header (4 bytes) */
-        0x00, 0x00, 0x00, 0x00,
-        
-        /* Tile data (zeros) */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    };
+    /* Construct a minimal valid VP9 keyframe packet (conformant header) */
+    uint8_t packet[1024];
+    size_t packet_size = vp9_synth_keyframe(packet, 128, 128, 0);
 
     cvp9_ctx_t *ctx = NULL;
     cvp9_config_t cfg = { .backend = CVP9_BACKEND_VULKAN };
     cvp9_err_t err = cvp9_create(&cfg, &ctx);
     if (err != CVP9_OK) FAIL("cvp9_create", cvp9_err_str(err));
 
-    err = cvp9_decode(ctx, packet, sizeof(packet), 12345);
+    err = cvp9_decode(ctx, packet, packet_size, 12345);
     if (err != CVP9_OK) FAIL("cvp9_decode", cvp9_err_str(err));
 
     cvp9_frame_info_t frame;
