@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../src/decoder/vp9_bitstream.h"
+#include "../src/decoder/vp9_entropy.h"
 
 static uint32_t rd_le32(const uint8_t *p) {
     return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -75,6 +76,10 @@ int main(int argc, char **argv)
     uint8_t *buf = malloc(1 << 22);
     int packet_no = 0, frame_no = 0, keyframes = 0;
     uint32_t last_w = ivf_w, last_h = ivf_h;
+
+    /* VP9 frame contexts, managed like the decoder does */
+    static vp9_entropy_probs_t fctx[4], fprobs;
+    for (int i = 0; i < 4; i++) vp9_entropy_probs_init(&fctx[i]);
 
     for (;;) {
         uint8_t fh[12];
@@ -140,8 +145,24 @@ int main(int argc, char **argv)
                       frame_no, hdr.log2_tile_cols);
             }
 
+            /* Compressed header: select/reset context, parse the updates */
+            if (hdr.frame_type == VP9_FRAME_KEY || hdr.error_resilient ||
+                hdr.reset_frame_context == 3) {
+                for (int c = 0; c < 4; c++) vp9_entropy_probs_init(&fctx[c]);
+            } else if (hdr.reset_frame_context == 2) {
+                vp9_entropy_probs_init(&fctx[hdr.frame_context_idx & 3]);
+            }
+            fprobs = fctx[hdr.frame_context_idx & 3];
+            int chdr_rc = vp9_parse_compressed_header(
+                &hdr, frames[i] + hdr.uncompressed_header_bytes,
+                hdr.first_partition_size, &fprobs);
+            CHECK(chdr_rc == 0, "frame %d: compressed header parse failed", frame_no);
+            if (hdr.refresh_frame_context) {
+                fctx[hdr.frame_context_idx & 3] = fprobs;
+            }
+
             printf("  frame %2d: %s%s %ux%u q=%d lf=%u tiles=2^%u refs=[%u,%u,%u] "
-                   "refresh=0x%02X hdr=%u+%u/%zuB\n",
+                   "refresh=0x%02X hdr=%u+%u/%zuB tx_mode=%d refmode=%d chdr=%s\n",
                    frame_no,
                    hdr.frame_type == VP9_FRAME_KEY ? "KEY" : "INTER",
                    hdr.show_frame ? "" : "(hidden)",
@@ -149,7 +170,9 @@ int main(int argc, char **argv)
                    hdr.log2_tile_cols,
                    hdr.ref_frame_idx[0], hdr.ref_frame_idx[1], hdr.ref_frame_idx[2],
                    hdr.refresh_frame_flags,
-                   hdr.uncompressed_header_bytes, hdr.first_partition_size, sizes[i]);
+                   hdr.uncompressed_header_bytes, hdr.first_partition_size, sizes[i],
+                   fprobs.tx_mode, fprobs.reference_mode,
+                   chdr_rc == 0 ? "ok" : "FAIL");
             frame_no++;
         }
         packet_no++;

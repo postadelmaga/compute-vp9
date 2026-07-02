@@ -23,12 +23,23 @@ void vpx_reader_fill(vpx_reader *r) {
   const uint8_t *buffer_end = r->buffer_end;
   BD_VALUE value = r->value;
   int count = r->count;
+  const size_t bits_left = (size_t)(buffer_end - buffer) * 8;
   int shift = BD_VALUE_SIZE - 8 - (count + 8);
 
-  while (shift >= 0 && buffer < buffer_end) {
-    value |= (BD_VALUE)*buffer++ << shift;
-    shift -= 8;
-    count += 8;
+  /* Past the end of the buffer the stream continues with implicit zeros;
+   * LOTS_OF_BITS marks that state so reads keep working (libvpx semantics) */
+  const int bits_over = shift + 8 - (int)bits_left;
+  int loop_end = 0;
+  if (bits_over >= 0) {
+    count += LOTS_OF_BITS;
+    loop_end = bits_over;
+  }
+  if (bits_over < 0 || bits_left) {
+    while (shift >= loop_end) {
+      count += 8;
+      value |= (BD_VALUE)*buffer++ << shift;
+      shift -= 8;
+    }
   }
 
   r->buffer = buffer;

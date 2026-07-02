@@ -12,8 +12,24 @@
 #define PLANE_TYPES 2
 #define REF_TYPES 2
 #define COEF_BANDS 6
-#define COEFF_CONTEXTS 3
+#define COEFF_CONTEXTS 6
 #define UNCONSTRAINED_NODES 3
+
+/* VP9 transform modes (frame level) */
+typedef enum {
+    VP9_TX_ONLY_4X4 = 0,
+    VP9_TX_ALLOW_8X8 = 1,
+    VP9_TX_ALLOW_16X16 = 2,
+    VP9_TX_ALLOW_32X32 = 3,
+    VP9_TX_MODE_SELECT = 4,
+} vp9_tx_mode_t;
+
+/* VP9 frame reference modes */
+typedef enum {
+    VP9_SINGLE_REFERENCE = 0,
+    VP9_COMPOUND_REFERENCE = 1,
+    VP9_REFERENCE_MODE_SELECT = 2,
+} vp9_reference_mode_t;
 
 /* VP9 coefficient token definitions */
 typedef enum {
@@ -50,16 +66,37 @@ typedef enum {
     NEWMV = 13
 } vp9_prediction_mode_t;
 
-/* Probability context tables */
+/* Probability context tables (one VP9 frame context) */
 typedef struct {
     uint8_t coef_probs[TX_SIZES][PLANE_TYPES][REF_TYPES][COEF_BANDS][COEFF_CONTEXTS][UNCONSTRAINED_NODES];
     uint8_t skip_probs[3];
     uint8_t intra_inter_probs[4];
-    uint8_t tx_probs[3][2];
+    uint8_t tx8_probs[2][1];
+    uint8_t tx16_probs[2][2];
+    uint8_t tx32_probs[2][3];
     uint8_t partition_probs[16][3];
     uint8_t y_mode_probs[4][9];
     uint8_t uv_mode_probs[10][9];
     uint8_t inter_mode_probs[7][3];
+    uint8_t switchable_interp_probs[4][2];
+    uint8_t comp_inter_probs[5];
+    uint8_t single_ref_probs[5][2];
+    uint8_t comp_ref_probs[5];
+
+    /* Motion vector context (nmv) */
+    uint8_t mv_joint_probs[3];
+    uint8_t mv_sign_probs[2];
+    uint8_t mv_class_probs[2][10];
+    uint8_t mv_class0_probs[2][1];
+    uint8_t mv_bits_probs[2][10];
+    uint8_t mv_class0_fr_probs[2][2][3];
+    uint8_t mv_fr_probs[2][3];
+    uint8_t mv_class0_hp_probs[2];
+    uint8_t mv_hp_probs[2];
+
+    /* Per-frame coding state read from the compressed header */
+    uint8_t tx_mode;         /* vp9_tx_mode_t */
+    uint8_t reference_mode;  /* vp9_reference_mode_t */
 } vp9_entropy_probs_t;
 
 /* Scan tables mapping scan-index to raster-index */
@@ -108,5 +145,16 @@ int vp9_read_inter_mode(vpx_reader *r, const uint8_t probs[3]);
  * Adapts frame context probabilities dynamically based on decoded symbol counts.
  */
 void vp9_adapt_probabilities(vp9_entropy_probs_t *probs, const vp9_parsed_frame_t *pf);
+
+/**
+ * Parse the VP9 compressed header (spec §6.3): tx mode and every
+ * probability update, applied on top of the current frame context.
+ * `data`/`size` delimit exactly the compressed header partition
+ * (header_size_in_bytes from the uncompressed header).
+ * Returns 0 on success.
+ */
+int vp9_parse_compressed_header(const vp9_frame_header_t *hdr,
+                                const uint8_t *data, size_t size,
+                                vp9_entropy_probs_t *fc);
 
 

@@ -25,7 +25,10 @@ struct cvp9_ctx {
     uint32_t         width;
     uint32_t         height;
 
-    /* Entropy probabilities and parsed metadata context */
+    /* Entropy probabilities: the 4 persistent VP9 frame contexts plus the
+     * working copy used by the current frame (context + compressed-header
+     * updates) */
+    vp9_entropy_probs_t frame_contexts[4];
     vp9_entropy_probs_t probs;
     vp9_parsed_frame_t *parsed_frame;
 
@@ -57,6 +60,38 @@ static cvp9_backend_t select_backend(cvp9_backend_t preferred)
     return CVP9_BACKEND_CPU;
 }
 
+/* Select/reset the VP9 frame context for this frame, then apply the
+ * compressed header's probability updates onto the working copy. */
+static void setup_frame_probs(cvp9_ctx_t *ctx, const vp9_frame_header_t *hdr,
+                              const uint8_t *data, size_t size)
+{
+    if (hdr->frame_type == VP9_FRAME_KEY || hdr->error_resilient ||
+        hdr->reset_frame_context == 3) {
+        for (int i = 0; i < 4; i++)
+            vp9_entropy_probs_init(&ctx->frame_contexts[i]);
+    } else if (hdr->reset_frame_context == 2) {
+        vp9_entropy_probs_init(&ctx->frame_contexts[hdr->frame_context_idx & 3]);
+    }
+
+    ctx->probs = ctx->frame_contexts[hdr->frame_context_idx & 3];
+
+    size_t off = hdr->uncompressed_header_bytes;
+    if (hdr->first_partition_size > 0 && off + hdr->first_partition_size <= size) {
+        if (vp9_parse_compressed_header(hdr, data + off,
+                                        hdr->first_partition_size, &ctx->probs) != 0) {
+            fprintf(stderr, "[compute-vp9] compressed header parse failed\n");
+        }
+    }
+}
+
+/* Persist the frame's (updated) probabilities back into its context */
+static void save_frame_probs(cvp9_ctx_t *ctx, const vp9_frame_header_t *hdr)
+{
+    if (hdr->refresh_frame_context) {
+        ctx->frame_contexts[hdr->frame_context_idx & 3] = ctx->probs;
+    }
+}
+
 /* ── Public API ─────────────────────────────────────────────────────────── */
 
 cvp9_err_t cvp9_create(const cvp9_config_t *cfg, cvp9_ctx_t **out)
@@ -66,6 +101,9 @@ cvp9_err_t cvp9_create(const cvp9_config_t *cfg, cvp9_ctx_t **out)
 
     cvp9_backend_t preferred = cfg ? cfg->backend : CVP9_BACKEND_AUTO;
     ctx->backend = select_backend(preferred);
+
+    for (int i = 0; i < 4; i++) vp9_entropy_probs_init(&ctx->frame_contexts[i]);
+    vp9_entropy_probs_init(&ctx->probs);
 
     cvp9_err_t err = CVP9_OK;
 
@@ -141,12 +179,12 @@ cvp9_err_t cvp9_decode(cvp9_ctx_t *ctx,
         if (ctx->parsed_frame) vp9_parsed_frame_free(ctx->parsed_frame);
         ctx->parsed_frame = vp9_parsed_frame_alloc(hdr->width, hdr->height);
         if (!ctx->parsed_frame) return CVP9_ERR_NOMEM;
-        
-        /* Initialize default entropy probabilities */
-        vp9_entropy_probs_init(&ctx->probs);
     }
 
-    /* 2. Tile data follows the uncompressed + compressed headers */
+    /* 2. Frame context selection + compressed header (probability updates) */
+    setup_frame_probs(ctx, hdr, data, size);
+
+    /* Tile data follows the uncompressed + compressed headers */
     size_t tile_offset = (size_t)hdr->uncompressed_header_bytes + hdr->first_partition_size;
     if (tile_offset >= size) return CVP9_ERR_INVALID_DATA;
 
@@ -157,8 +195,7 @@ cvp9_err_t cvp9_decode(cvp9_ctx_t *ctx,
     int parse_rc = vp9_decode_tiles(hdr, tile_data, tile_size, &ctx->probs, ctx->parsed_frame);
     if (parse_rc != 0) return CVP9_ERR_INVALID_DATA;
 
-    /* Adapt entropy probabilities for the next frame */
-    vp9_adapt_probabilities(&ctx->probs, ctx->parsed_frame);
+    save_frame_probs(ctx, hdr);
 
     /* 4. Dispatch to compute backend or CPU fallback */
     cvp9_err_t err = CVP9_ERR_UNSUPPORTED;
@@ -353,19 +390,22 @@ cvp9_err_t cvp9_decode_vaapi(cvp9_ctx_t *ctx,
         ? 0xFF
         : (uint8_t)(1u << (pic_param->pic_fields.bits.last_ref_frame & 7));
 
-    /* base_qindex is not part of the VA-API picture parameters — it lives in
-     * the uncompressed frame header, so parse it from the bitstream. The
-     * parse also yields the exact tile data offset. */
-    size_t parsed_tile_offset = 0;
+    /* The bitstream's uncompressed header is authoritative (qindex, exact
+     * header offsets, refresh flags, ref slots, frame context state are not
+     * all present in the VA parameters) — parse it and let it win over the
+     * pic_param mapping above when it succeeds */
     {
         vp9_bitreader_t br;
         vp9_frame_header_t parsed;
         vp9_bitreader_init(&br, data, size);
         if (vp9_parse_frame_header(&br, &parsed, hdr->width, hdr->height) == 0 &&
             !parsed.show_existing_frame) {
-            hdr->base_qindex = parsed.base_qindex;
-            parsed_tile_offset = (size_t)parsed.uncompressed_header_bytes +
-                                 parsed.first_partition_size;
+            uint32_t fallback_w = hdr->width, fallback_h = hdr->height;
+            *hdr = parsed;
+            if (hdr->width == 0) {
+                hdr->width = fallback_w;
+                hdr->height = fallback_h;
+            }
         }
     }
 
@@ -374,15 +414,19 @@ cvp9_err_t cvp9_decode_vaapi(cvp9_ctx_t *ctx,
         if (ctx->parsed_frame) vp9_parsed_frame_free(ctx->parsed_frame);
         ctx->parsed_frame = vp9_parsed_frame_alloc(hdr->width, hdr->height);
         if (!ctx->parsed_frame) return CVP9_ERR_NOMEM;
-        
-        /* Initialize default entropy probabilities */
-        vp9_entropy_probs_init(&ctx->probs);
     }
+
+    /* Frame context selection + compressed header (probability updates) */
+    setup_frame_probs(ctx, hdr, data, size);
 
     /* 3. Parse tiles from the bitstream using the range coder/entropy parser.
      * Prefer the offset computed by our own header parse; fall back to the
      * VA-provided header lengths. */
-    size_t tile_data_offset = parsed_tile_offset;
+    size_t tile_data_offset = 0;
+    if (hdr->first_partition_size > 0) {
+        tile_data_offset = (size_t)hdr->uncompressed_header_bytes +
+                           hdr->first_partition_size;
+    }
     if (tile_data_offset == 0) {
         tile_data_offset = pic_param->frame_header_length_in_bytes +
                            pic_param->first_partition_size;
@@ -396,8 +440,7 @@ cvp9_err_t cvp9_decode_vaapi(cvp9_ctx_t *ctx,
     int parse_rc = vp9_decode_tiles(hdr, tile_data, tile_size, &ctx->probs, ctx->parsed_frame);
     if (parse_rc != 0) return CVP9_ERR_INVALID_DATA;
 
-    /* Adapt entropy probabilities for the next frame */
-    vp9_adapt_probabilities(&ctx->probs, ctx->parsed_frame);
+    save_frame_probs(ctx, hdr);
 
     /* 4. Dispatch to compute backend or CPU fallback */
     cvp9_err_t err = CVP9_ERR_UNSUPPORTED;

@@ -58,6 +58,7 @@ add_library(compute_vp9 SHARED
     src/decoder/vp9_bitstream.c
     src/decoder/vpx_reader.c
     src/decoder/vp9_entropy.c
+    src/decoder/vp9_compressed_hdr.c
     src/decoder/vp9_tile.c
     src/decoder/vp9_frame.c
     src/decoder/vp9_parsed_frame.c

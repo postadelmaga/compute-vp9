@@ -32,8 +32,9 @@ void vpx_reader_fill(vpx_reader *r);
 const uint8_t *vpx_reader_find_end(vpx_reader *r);
 
 static inline int vpx_reader_has_error(vpx_reader *r) {
-  // If count has accumulated too many shifts and we've read past the end, error out.
-  return r->count > BD_VALUE_SIZE && r->buffer >= r->buffer_end;
+  /* LOTS_OF_BITS marks end-of-stream reads: an error is only flagged once
+   * the decoder consumed more (virtual) bits than the stream ever had */
+  return r->count > BD_VALUE_SIZE && r->count < LOTS_OF_BITS;
 }
 
 // 256-byte normalization table used by the range decoder
@@ -56,58 +57,42 @@ static const uint8_t vpx_norm[256] = {
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
+/* Canonical libvpx vpx_read: refill happens at entry when the buffered bit
+ * budget went negative, and normalization always runs (vpx_norm is 0 for
+ * range >= 128) — bit-exact with the reference decoder. */
 static inline int vpx_read(vpx_reader *r, int prob) {
+  unsigned int bit = 0;
+  BD_VALUE value;
+  BD_VALUE bigsplit;
+  int count;
+  unsigned int range;
   unsigned int split = (r->range * prob + (256 - prob)) >> 8;
-  BD_VALUE value = r->value;
-  int count = r->count;
-  unsigned int range = r->range;
-  BD_VALUE bigsplit = (BD_VALUE)split << (BD_VALUE_SIZE - 8);
-  int bit;
+
+  if (r->count < 0) vpx_reader_fill(r);
+
+  value = r->value;
+  count = r->count;
+
+  bigsplit = (BD_VALUE)split << (BD_VALUE_SIZE - 8);
+
+  range = split;
 
   if (value >= bigsplit) {
-    range -= split;
-    value -= bigsplit;
+    range = r->range - split;
+    value = value - bigsplit;
     bit = 1;
-  } else {
-    range = split;
-    bit = 0;
   }
 
-  if (range >= 128) {
-    r->value = value;
-    r->range = range;
-    return bit;
-  }
-
-  // Normalization
-  int shift = vpx_norm[range];
-  range <<= shift;
-  value <<= shift;
-  count -= shift;
-
-  if (count < 0) {
-    // Fill the buffer
-    const uint8_t *buffer = r->buffer;
-    const uint8_t *buffer_end = r->buffer_end;
-    int loop_end = 0 - count;
-    int fill_shift = BD_VALUE_SIZE - 8 - loop_end;
-
-    while (loop_end >= 8 && buffer < buffer_end) {
-      value |= (BD_VALUE)*buffer++ << fill_shift;
-      loop_end -= 8;
-      fill_shift += 8;
-      count += 8;
-    }
-    if (loop_end >= 0 && buffer < buffer_end) {
-      value |= (BD_VALUE)*buffer++ << fill_shift;
-      count += 8;
-    }
-    r->buffer = buffer;
+  {
+    const unsigned char shift = vpx_norm[(unsigned char)range];
+    range <<= shift;
+    value <<= shift;
+    count -= shift;
   }
 
   r->value = value;
-  r->range = range;
   r->count = count;
+  r->range = range;
 
   return bit;
 }

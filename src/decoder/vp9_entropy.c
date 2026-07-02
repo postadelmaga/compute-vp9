@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "vp9_parsed_frame.h"
+#include "vp9_default_probs.h"
 
 /* Scan tables allocated globally and generated dynamically on first use */
 uint16_t vp9_default_scan_4x4[16];
@@ -49,15 +50,40 @@ static void init_scans(void)
 void vp9_entropy_probs_init(vp9_entropy_probs_t *probs)
 {
     init_scans();
-    
-    memset(probs->coef_probs, 128, sizeof(probs->coef_probs));
-    memset(probs->skip_probs, 128, sizeof(probs->skip_probs));
-    memset(probs->intra_inter_probs, 128, sizeof(probs->intra_inter_probs));
-    memset(probs->tx_probs, 128, sizeof(probs->tx_probs));
-    memset(probs->partition_probs, 128, sizeof(probs->partition_probs));
-    memset(probs->y_mode_probs, 128, sizeof(probs->y_mode_probs));
-    memset(probs->uv_mode_probs, 128, sizeof(probs->uv_mode_probs));
-    memset(probs->inter_mode_probs, 128, sizeof(probs->inter_mode_probs));
+
+    /* Spec default frame context (libvpx tables) */
+    memcpy(probs->coef_probs[0], vp9_def_coef_probs_4x4, sizeof(vp9_def_coef_probs_4x4));
+    memcpy(probs->coef_probs[1], vp9_def_coef_probs_8x8, sizeof(vp9_def_coef_probs_8x8));
+    memcpy(probs->coef_probs[2], vp9_def_coef_probs_16x16, sizeof(vp9_def_coef_probs_16x16));
+    memcpy(probs->coef_probs[3], vp9_def_coef_probs_32x32, sizeof(vp9_def_coef_probs_32x32));
+
+    memcpy(probs->skip_probs, vp9_def_skip_probs, sizeof(probs->skip_probs));
+    memcpy(probs->intra_inter_probs, vp9_def_intra_inter_probs, sizeof(probs->intra_inter_probs));
+    memcpy(probs->tx8_probs, vp9_def_tx8_probs, sizeof(probs->tx8_probs));
+    memcpy(probs->tx16_probs, vp9_def_tx16_probs, sizeof(probs->tx16_probs));
+    memcpy(probs->tx32_probs, vp9_def_tx32_probs, sizeof(probs->tx32_probs));
+    memcpy(probs->partition_probs, vp9_def_partition_probs, sizeof(probs->partition_probs));
+    memcpy(probs->y_mode_probs, vp9_def_if_y_probs, sizeof(probs->y_mode_probs));
+    memcpy(probs->uv_mode_probs, vp9_def_if_uv_probs, sizeof(probs->uv_mode_probs));
+    memcpy(probs->inter_mode_probs, vp9_def_inter_mode_probs, sizeof(probs->inter_mode_probs));
+    memcpy(probs->switchable_interp_probs, vp9_def_switchable_interp_probs,
+           sizeof(probs->switchable_interp_probs));
+    memcpy(probs->comp_inter_probs, vp9_def_comp_inter_probs, sizeof(probs->comp_inter_probs));
+    memcpy(probs->single_ref_probs, vp9_def_single_ref_probs, sizeof(probs->single_ref_probs));
+    memcpy(probs->comp_ref_probs, vp9_def_comp_ref_probs, sizeof(probs->comp_ref_probs));
+
+    memcpy(probs->mv_joint_probs, vp9_def_mv_joint_probs, sizeof(probs->mv_joint_probs));
+    memcpy(probs->mv_sign_probs, vp9_def_mv_sign_probs, sizeof(probs->mv_sign_probs));
+    memcpy(probs->mv_class_probs, vp9_def_mv_class_probs, sizeof(probs->mv_class_probs));
+    memcpy(probs->mv_class0_probs, vp9_def_mv_class0_probs, sizeof(probs->mv_class0_probs));
+    memcpy(probs->mv_bits_probs, vp9_def_mv_bits_probs, sizeof(probs->mv_bits_probs));
+    memcpy(probs->mv_class0_fr_probs, vp9_def_mv_class0_fr_probs, sizeof(probs->mv_class0_fr_probs));
+    memcpy(probs->mv_fr_probs, vp9_def_mv_fr_probs, sizeof(probs->mv_fr_probs));
+    memcpy(probs->mv_class0_hp_probs, vp9_def_mv_class0_hp_probs, sizeof(probs->mv_class0_hp_probs));
+    memcpy(probs->mv_hp_probs, vp9_def_mv_hp_probs, sizeof(probs->mv_hp_probs));
+
+    probs->tx_mode = VP9_TX_MODE_SELECT;
+    probs->reference_mode = VP9_SINGLE_REFERENCE;
 }
 
 /* VP9 coefficient Huffman tree decisions */
