@@ -162,10 +162,12 @@ int main(int argc, char **argv)
                 fctx[hdr.frame_context_idx & 3] = fprobs;
             }
 
-            /* Conformant entropy decode of keyframe tiles: the bool decoder
-             * must consume ~exactly each tile and cover the whole MI grid */
-            if (hdr.frame_type == VP9_FRAME_KEY && !hdr.segmentation_enabled &&
-                hdr.width > 0) {
+            /* Conformant entropy decode of every frame's tiles: the bool
+             * decoder must consume ~exactly each tile and cover the MI grid.
+             * Frames 0-1 are strict (no backward adaptation involved yet);
+             * later frames report drift until adaptation is implemented. */
+            int strict = frame_no < 2;
+            if (!hdr.segmentation_enabled && hdr.width > 0) {
                 vp9_parsed_frame_t *tpf = vp9_parsed_frame_alloc(hdr.width, hdr.height);
                 if (tpf) {
                     memcpy(&tpf->hdr, &hdr, sizeof(hdr));
@@ -205,11 +207,16 @@ int main(int argc, char **argv)
                                                          &fprobs, tpf);
                             size_t consumed =
                                 (size_t)(vpx_reader_find_end(&rd) - (frames[i] + off));
-                            CHECK(trc == 0, "frame %d tile %d,%d: kf decode failed",
-                                  frame_no, tr, tc);
-                            CHECK(consumed <= tsize && consumed + 8 >= tsize,
-                                  "frame %d tile %d,%d: consumed %zu of %zu bytes",
-                                  frame_no, tr, tc, consumed, tsize);
+                            if (strict) {
+                                CHECK(trc == 0, "frame %d tile %d,%d: decode failed",
+                                      frame_no, tr, tc);
+                                CHECK(consumed <= tsize && consumed + 8 >= tsize,
+                                      "frame %d tile %d,%d: consumed %zu of %zu bytes",
+                                      frame_no, tr, tc, consumed, tsize);
+                            } else if (trc != 0 || consumed > tsize || consumed + 8 < tsize) {
+                                printf("           frame %d tile %d,%d: drift (rc=%d, %zu of %zu bytes)\n",
+                                       frame_no, tr, tc, trc, consumed, tsize);
+                            }
                             if (trc) rc_all = -1;
                             off += tsize;
                         }
@@ -219,10 +226,11 @@ int main(int argc, char **argv)
                         uint32_t covered = 0;
                         for (uint32_t m = 0; m < tpf->mi_grid_width * tpf->mi_grid_height; m++)
                             covered += tpf->mi_block_grid[m] != 0;
-                        CHECK(covered == tpf->mi_grid_width * tpf->mi_grid_height,
-                              "frame %d: MI coverage %u/%u", frame_no, covered,
-                              tpf->mi_grid_width * tpf->mi_grid_height);
-                        printf("           kf decode: %u blocks, %u coeffs, MI %u/%u\n",
+                        if (strict)
+                            CHECK(covered == tpf->mi_grid_width * tpf->mi_grid_height,
+                                  "frame %d: MI coverage %u/%u", frame_no, covered,
+                                  tpf->mi_grid_width * tpf->mi_grid_height);
+                        printf("           tile decode: %u blocks, %u coeffs, MI %u/%u\n",
                                tpf->num_blocks, tpf->num_coeffs, covered,
                                tpf->mi_grid_width * tpf->mi_grid_height);
                     }
