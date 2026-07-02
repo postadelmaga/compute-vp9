@@ -253,18 +253,19 @@ int vp9_decode_tx_block(vpx_reader *r, int tx_size, int plane_type, int ref_type
 
 int vp9_read_intra_mode(vpx_reader *r, const uint8_t probs[9])
 {
+    /* Spec vp9_intra_mode_tree (libvpx vp9_entropymode.c) */
     static const int8_t tree[] = {
-        -DC_PRED, 2,
-        -V_PRED, 4,
-        -H_PRED, 6,
-        -D45_PRED, 8,
-        -D135_PRED, 10,
-        -D117_PRED, 12,
-        -D127_PRED, 14,
-        -D207_PRED, 16,
-        -D63_PRED, -TM_PRED
+        -DC_PRED,   2,
+        -TM_PRED,   4,
+        -V_PRED,    6,
+        8,          12,
+        -H_PRED,    10,
+        -D135_PRED, -D117_PRED,
+        -D45_PRED,  14,
+        -D63_PRED,  16,
+        -D127_PRED, -D207_PRED   /* D127 == spec D153 slot */
     };
-    
+
     int i = 0;
     while ((i = tree[i + vpx_read(r, probs[i >> 1])]) > 0)
         ;

@@ -48,9 +48,10 @@ void vpx_reader_fill(vpx_reader *r) {
 }
 
 const uint8_t *vpx_reader_find_end(vpx_reader *r) {
-  // Return position where reader has parsed up to.
-  // We subtract the unused bits still buffered in 'value'.
-  int unused_bits = (r->count & 7) + (r->count >> 3) * 8;
-  if (unused_bits < 0) unused_bits = 0;
-  return r->buffer - (unused_bits >> 3);
+  /* Canonical libvpx: walk back the bytes still buffered in 'value' */
+  while (r->count > 8 && r->count < BD_VALUE_SIZE) {
+    r->count -= 8;
+    r->buffer--;
+  }
+  return r->buffer;
 }

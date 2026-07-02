@@ -13,6 +13,7 @@
 #include <string.h>
 #include "../src/decoder/vp9_bitstream.h"
 #include "../src/decoder/vp9_entropy.h"
+#include "../src/decoder/vp9_tile.h"
 
 static uint32_t rd_le32(const uint8_t *p) {
     return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -160,6 +161,75 @@ int main(int argc, char **argv)
             if (hdr.refresh_frame_context) {
                 fctx[hdr.frame_context_idx & 3] = fprobs;
             }
+
+            /* Conformant entropy decode of keyframe tiles: the bool decoder
+             * must consume ~exactly each tile and cover the whole MI grid */
+            if (hdr.frame_type == VP9_FRAME_KEY && !hdr.segmentation_enabled &&
+                hdr.width > 0) {
+                vp9_parsed_frame_t *tpf = vp9_parsed_frame_alloc(hdr.width, hdr.height);
+                if (tpf) {
+                    memcpy(&tpf->hdr, &hdr, sizeof(hdr));
+                    int mi_cols = ((int)hdr.width + 7) >> 3;
+                    int mi_rows = ((int)hdr.height + 7) >> 3;
+                    int sb_cols = (mi_cols + 7) >> 3, sb_rows = (mi_rows + 7) >> 3;
+                    int tcols = 1 << hdr.log2_tile_cols, trows = 1 << hdr.log2_tile_rows;
+                    size_t off = (size_t)hdr.uncompressed_header_bytes + hdr.first_partition_size;
+                    int rc_all = 0;
+
+                    for (int tr = 0; tr < trows && !rc_all; tr++) {
+                        int r0 = ((tr * sb_rows) >> hdr.log2_tile_rows) << 3;
+                        int r1 = (((tr + 1) * sb_rows) >> hdr.log2_tile_rows) << 3;
+                        if (r1 > mi_rows) r1 = mi_rows;
+                        for (int tc = 0; tc < tcols && !rc_all; tc++) {
+                            int c0 = ((tc * sb_cols) >> hdr.log2_tile_cols) << 3;
+                            int c1 = (((tc + 1) * sb_cols) >> hdr.log2_tile_cols) << 3;
+                            if (c1 > mi_cols) c1 = mi_cols;
+
+                            size_t tsize;
+                            if (tr == trows - 1 && tc == tcols - 1) {
+                                tsize = sizes[i] - off;
+                            } else {
+                                tsize = ((size_t)frames[i][off] << 24) |
+                                        ((size_t)frames[i][off + 1] << 16) |
+                                        ((size_t)frames[i][off + 2] << 8) |
+                                        frames[i][off + 3];
+                                off += 4;
+                            }
+
+                            vpx_reader rd;
+                            if (vpx_reader_init(&rd, frames[i] + off, tsize)) {
+                                rc_all = -1;
+                                break;
+                            }
+                            int trc = vp9_decode_tile_kf(&rd, r0, r1, c0, c1,
+                                                         &fprobs, tpf);
+                            size_t consumed =
+                                (size_t)(vpx_reader_find_end(&rd) - (frames[i] + off));
+                            CHECK(trc == 0, "frame %d tile %d,%d: kf decode failed",
+                                  frame_no, tr, tc);
+                            CHECK(consumed <= tsize && consumed + 8 >= tsize,
+                                  "frame %d tile %d,%d: consumed %zu of %zu bytes",
+                                  frame_no, tr, tc, consumed, tsize);
+                            if (trc) rc_all = -1;
+                            off += tsize;
+                        }
+                    }
+
+                    if (!rc_all) {
+                        uint32_t covered = 0;
+                        for (uint32_t m = 0; m < tpf->mi_grid_width * tpf->mi_grid_height; m++)
+                            covered += tpf->mi_block_grid[m] != 0;
+                        CHECK(covered == tpf->mi_grid_width * tpf->mi_grid_height,
+                              "frame %d: MI coverage %u/%u", frame_no, covered,
+                              tpf->mi_grid_width * tpf->mi_grid_height);
+                        printf("           kf decode: %u blocks, %u coeffs, MI %u/%u\n",
+                               tpf->num_blocks, tpf->num_coeffs, covered,
+                               tpf->mi_grid_width * tpf->mi_grid_height);
+                    }
+                    vp9_parsed_frame_free(tpf);
+                }
+            }
+
 
             printf("  frame %2d: %s%s %ux%u q=%d lf=%u tiles=2^%u refs=[%u,%u,%u] "
                    "refresh=0x%02X hdr=%u+%u/%zuB tx_mode=%d refmode=%d chdr=%s\n",

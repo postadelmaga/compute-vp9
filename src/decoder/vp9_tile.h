@@ -27,7 +27,16 @@ int vp9_decode_tiles(const vp9_frame_header_t *hdr,
                      vp9_parsed_frame_t *pf);
 
 /**
- * Decodes a single tile.
+ * Decodes a single keyframe tile on the spec-conformant path (vp9_kf_tile.c).
+ */
+int vp9_decode_tile_kf(vpx_reader *r,
+                       int mi_row_start, int mi_row_end,
+                       int mi_col_start, int mi_col_end,
+                       const vp9_entropy_probs_t *probs,
+                       vp9_parsed_frame_t *pf);
+
+/**
+ * Decodes a single tile (legacy approximate parser, inter frames).
  */
 int vp9_decode_tile(vpx_reader *r,
                     int mi_row_start, int mi_row_end,

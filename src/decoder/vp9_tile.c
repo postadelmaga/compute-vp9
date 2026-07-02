@@ -18,16 +18,35 @@ typedef struct {
     int                         rc;
 } tile_job_t;
 
+/* Keyframes decode on the spec-conformant path; inter frames still use the
+ * legacy approximate parser until their syntax is ported. */
+static int tile_is_conformant(const vp9_parsed_frame_t *pf)
+{
+    return pf->hdr.frame_type == VP9_FRAME_KEY && !pf->hdr.segmentation_enabled;
+}
+
+static int decode_one_tile(const uint8_t *data, size_t size,
+                           int mi_row_start, int mi_row_end,
+                           int mi_col_start, int mi_col_end,
+                           const vp9_entropy_probs_t *probs,
+                           vp9_parsed_frame_t *pf)
+{
+    vpx_reader r;
+    if (vpx_reader_init(&r, data, size)) return -1;
+
+    if (tile_is_conformant(pf)) {
+        return vp9_decode_tile_kf(&r, mi_row_start, mi_row_end,
+                                  mi_col_start, mi_col_end, probs, pf);
+    }
+    return vp9_decode_tile(&r, mi_row_start, mi_row_end,
+                           mi_col_start, mi_col_end, probs, pf);
+}
+
 static void *tile_worker(void *arg)
 {
     tile_job_t *job = (tile_job_t *)arg;
-
-    vpx_reader r;
-    if (vpx_reader_init(&r, job->data, job->size)) {
-        job->rc = -1;
-        return NULL;
-    }
-    job->rc = vp9_decode_tile(&r, job->mi_row_start, job->mi_row_end,
+    job->rc = decode_one_tile(job->data, job->size,
+                              job->mi_row_start, job->mi_row_end,
                               job->mi_col_start, job->mi_col_end,
                               job->probs, job->pf);
     return NULL;
@@ -150,9 +169,8 @@ int vp9_decode_tiles(const vp9_frame_header_t *hdr,
 
     /* Single tile: parse straight into the output frame, no threads */
     if (n == 1) {
-        vpx_reader r;
-        if (vpx_reader_init(&r, jobs[0].data, jobs[0].size)) return -1;
-        return vp9_decode_tile(&r, jobs[0].mi_row_start, jobs[0].mi_row_end,
+        return decode_one_tile(jobs[0].data, jobs[0].size,
+                               jobs[0].mi_row_start, jobs[0].mi_row_end,
                                jobs[0].mi_col_start, jobs[0].mi_col_end, probs, pf);
     }
 

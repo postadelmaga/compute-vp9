@@ -1709,3 +1709,20 @@ static const int16_t vp9_row_scan_16x16_nb[514] = {
   236, 251, 251, 221, 221, 252, 252, 222, 222, 237, 237, 238, 238, 253, 253,
   254, 254, 0,   0,
 };
+
+/* ── Block geometry / lookup tables (libvpx vp9_common_data.c) ─────── */
+static const uint8_t vp9_b_width_log2[13] = {0,0,1,1,1,2,2,2,3,3,3,4,4};
+static const uint8_t vp9_b_height_log2[13] = {0,1,0,1,2,1,2,3,2,3,4,3,4};
+static const uint8_t vp9_num_4x4_w[13] = {1,1,2,2,2,4,4,4,8,8,8,16,16};
+static const uint8_t vp9_num_4x4_h[13] = {1,2,1,2,4,2,4,8,4,8,16,8,16};
+static const uint8_t vp9_num_8x8_w[13] = {1,1,1,1,1,2,2,2,4,4,4,8,8};
+static const uint8_t vp9_num_8x8_h[13] = {1,1,1,1,2,1,2,4,2,4,8,4,8};
+static const uint8_t vp9_size_group[13] = {0,0,0,1,1,1,2,2,2,3,3,3,3};
+static const uint8_t vp9_max_txsize[13] = {0,0,0,1,1,1,2,2,2,3,3,3,3};
+static const uint8_t vp9_subsize_lookup[4][13] = {{0,1,2,3,4,5,6,7,8,9,10,11,12},{255,255,255,2,255,255,5,255,255,8,255,255,11},{255,255,255,1,255,255,4,255,255,7,255,255,10},{255,255,255,0,255,255,3,255,255,6,255,255,9}};
+static const uint8_t vp9_ss_size_lookup[13][2][2] = {{{0,255},{255,255}},{{1,0},{255,255}},{{2,255},{0,255}},{{3,2},{1,0}},{{4,3},{255,1}},{{5,255},{3,2}},{{6,5},{4,3}},{{7,6},{255,4}},{{8,255},{6,5}},{{9,8},{7,6}},{{10,9},{255,7}},{{11,255},{9,8}},{{12,11},{10,9}}};
+static const uint8_t vp9_partition_ctx_above[13] = {15,15,14,14,14,12,12,12,8,8,8,0,0};
+static const uint8_t vp9_partition_ctx_left[13] = {15,14,15,14,12,14,12,8,12,8,0,8,0};
+static const uint8_t vp9_pt_energy_class_tbl[12] = {0,1,2,3,3,4,4,5,5,5,5,5};
+/* DC,V,H,D45,D135,D117,D153,D207,D63,TM → DCT_DCT/ADST_DCT/DCT_ADST/ADST_ADST */
+static const uint8_t vp9_intra_mode_to_tx_type[10] = {0,1,2,0,3,1,2,2,1,3};
