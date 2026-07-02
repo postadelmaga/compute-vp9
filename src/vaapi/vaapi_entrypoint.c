@@ -40,6 +40,7 @@ typedef struct {
     cvp9_frame_info_t    frame;
     cvp9_export_buffer_t exp;
     int                  has_export;
+    int                  nv12_valid;  /* exp.mapped holds the latest frame */
 } cvp9_surface_t;
 
 typedef struct {
@@ -57,6 +58,7 @@ typedef struct {
      * ready (opportunistically) or in vaSyncSurface (blocking), so several
      * frames overlap on CPU+GPU at the cost of a few frames of latency. */
     VASurfaceID        pending_targets[MAX_PENDING];
+    uint8_t            pending_gpu_direct[MAX_PENDING];  /* GPU wrote NV12 into the surface already */
     int                pending_head;
     int                pending_count;
 
@@ -392,16 +394,25 @@ static VAStatus cvp9_RenderPicture(VADriverContextP ctx,
     return VA_STATUS_SUCCESS;
 }
 
-/* Deliver one decoded frame to its queued render target */
+/* Deliver one decoded frame to its queued render target. When the GPU
+ * already packed NV12 straight into the surface's DMA-BUF (gpu_direct),
+ * there is nothing left to copy. */
 static void cvp9_deliver_frame(cvp9_driver_data_t *drv, const cvp9_frame_info_t *frame)
 {
     if (drv->pending_count == 0) return;
     int target = (int)drv->pending_targets[drv->pending_head] - 1;
+    int gpu_direct = drv->pending_gpu_direct[drv->pending_head];
     drv->pending_head = (drv->pending_head + 1) % MAX_PENDING;
     drv->pending_count--;
     if (target >= 0 && target < MAX_SURFACES) {
-        cvp9_frame_copy(&drv->surfaces[target].frame, frame);
-        cvp9_surface_write_nv12(&drv->surfaces[target]);
+        cvp9_surface_t *surf = &drv->surfaces[target];
+        if (gpu_direct) {
+            surf->nv12_valid = 1;
+        } else {
+            cvp9_frame_copy(&surf->frame, frame);
+            cvp9_surface_write_nv12(surf);
+            surf->nv12_valid = surf->has_export;
+        }
     }
 }
 
@@ -430,6 +441,18 @@ static VAStatus cvp9_EndPicture(VADriverContextP ctx, VAContextID ctx_id)
     if (!drv) return VA_STATUS_ERROR_INVALID_CONTEXT;
     if (drv->bitstream_size == 0) return VA_STATUS_SUCCESS;
 
+    /* Direct-to-surface: if the render target has a DMA-BUF backing, ask
+     * the GPU to pack NV12 straight into it as part of the decode */
+    int gpu_direct = 0;
+    {
+        int target = (int)drv->current_render_target - 1;
+        if (target >= 0 && target < MAX_SURFACES &&
+            drv->surfaces[target].has_export) {
+            gpu_direct = (cvp9_set_render_target(drv->decoder,
+                              &drv->surfaces[target].exp) == CVP9_OK);
+        }
+    }
+
     /* Submit decode; if the GPU pipeline is full, deliver the oldest frame
      * first (blocking) and retry */
     cvp9_err_t err;
@@ -447,14 +470,16 @@ static VAStatus cvp9_EndPicture(VADriverContextP ctx, VAContextID ctx_id)
         cvp9_deliver_frame(drv, &frame);
     }
     if (err != CVP9_OK) {
+        cvp9_set_render_target(drv->decoder, NULL);
         fprintf(stderr, "[compute-vp9] VA-API decode failed: %d\n", err);
         return VA_STATUS_ERROR_DECODING_ERROR;
     }
 
     /* Queue the render target for asynchronous delivery */
     if (drv->pending_count < MAX_PENDING) {
-        drv->pending_targets[(drv->pending_head + drv->pending_count) % MAX_PENDING] =
-            drv->current_render_target;
+        int wr = (drv->pending_head + drv->pending_count) % MAX_PENDING;
+        drv->pending_targets[wr] = drv->current_render_target;
+        drv->pending_gpu_direct[wr] = (uint8_t)gpu_direct;
         drv->pending_count++;
     }
 
@@ -534,7 +559,8 @@ static VAStatus cvp9_GetImage(
 
     int surf_slot = (int)surface - 1;
     if (surf_slot < 0 || surf_slot >= MAX_SURFACES) return VA_STATUS_ERROR_INVALID_SURFACE;
-    cvp9_frame_info_t *surf_frame = &drv->surfaces[surf_slot].frame;
+    cvp9_surface_t *surf = &drv->surfaces[surf_slot];
+    cvp9_frame_info_t *surf_frame = &surf->frame;
     if (!surf_frame->plane_y) return VA_STATUS_ERROR_INVALID_SURFACE;
 
     int buf_slot = (int)image_id - 1;
@@ -554,13 +580,35 @@ static VAStatus cvp9_GetImage(
     if (width > w) width = w;
     if (height > h) height = h;
 
+    uint32_t ch = (height + 1) / 2;
+    uint32_t cw = (width + 1) / 2;
+
+    if (surf->nv12_valid && surf->has_export) {
+        /* Frame lives in the surface's NV12 DMA-BUF (GPU-direct delivery) */
+        const uint8_t *src_y = surf->exp.mapped;
+        const uint8_t *src_uv = src_y + size_y;
+        uint32_t scw = (w + 1) / 2;
+
+        for (uint32_t r = 0; r < height; r++) {
+            memcpy(dst + r * width, src_y + r * w, width);
+        }
+        for (uint32_t r = 0; r < ch; r++) {
+            const uint8_t *uv = src_uv + r * 2 * scw;
+            uint8_t *du = dst + size_y + r * cw;
+            uint8_t *dv = dst + size_y + size_uv + r * cw;
+            for (uint32_t c = 0; c < cw; c++) {
+                du[c] = uv[2 * c];
+                dv[c] = uv[2 * c + 1];
+            }
+        }
+        return VA_STATUS_SUCCESS;
+    }
+
     /* Copy Y plane */
     for (uint32_t r = 0; r < height; r++) {
         memcpy(dst + r * width, surf_frame->plane_y + r * surf_frame->stride_y, width);
     }
     /* Copy U plane */
-    uint32_t ch = (height + 1) / 2;
-    uint32_t cw = (width + 1) / 2;
     for (uint32_t r = 0; r < ch; r++) {
         memcpy(dst + size_y + r * cw, surf_frame->plane_u + r * surf_frame->stride_uv, cw);
     }

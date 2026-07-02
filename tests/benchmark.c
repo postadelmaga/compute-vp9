@@ -56,8 +56,26 @@ static void align_byte(bitwriter_t *bw) {
     }
 }
 
+/* Append tile payload: with N>1 tile columns, non-last tiles carry a 4-byte
+ * big-endian size header, the last tile takes the remaining bytes */
+static void write_tiles(bitwriter_t *bw, int log2_tile_cols)
+{
+    int tiles = 1 << log2_tile_cols;
+    for (int t = 0; t < tiles; t++) {
+        if (t != tiles - 1) {
+            bw->buf[bw->pos++] = 0x00;
+            bw->buf[bw->pos++] = 0x00;
+            bw->buf[bw->pos++] = 0x00;
+            bw->buf[bw->pos++] = 64;
+        }
+        memset(bw->buf + bw->pos, 0, 64);
+        bw->pos += 64;
+    }
+}
+
 /* Generates a synthetic VP9 keyframe packet matching our parser's dialect */
-static size_t generate_synthetic_keyframe(uint8_t *buf, uint32_t width, uint32_t height)
+static size_t generate_synthetic_keyframe(uint8_t *buf, uint32_t width, uint32_t height,
+                                          int log2_tile_cols)
 {
     memset(buf, 0, 1024);
     bitwriter_t bw = { .buf = buf, .pos = 0, .bit = 7 };
@@ -83,7 +101,8 @@ static size_t generate_synthetic_keyframe(uint8_t *buf, uint32_t width, uint32_t
     write_bits(&bw, 32, 6);  /* filter_level */
     write_bits(&bw, 0, 3);   /* sharpness_level */
 
-    write_bit(&bw, 0);       /* log2_tile_cols */
+    for (int i = 0; i < log2_tile_cols; i++) write_bit(&bw, 1);
+    write_bit(&bw, 0);       /* log2_tile_cols terminator */
     write_bit(&bw, 0);       /* log2_tile_rows */
 
     align_byte(&bw);
@@ -100,15 +119,14 @@ static size_t generate_synthetic_keyframe(uint8_t *buf, uint32_t width, uint32_t
     buf[bw.pos++] = 0x00;
     buf[bw.pos++] = 0x00;
 
-    /* Write tile data (64 bytes of zeros) */
-    memset(buf + bw.pos, 0, 64);
-    bw.pos += 64;
+    write_tiles(&bw, log2_tile_cols);
 
     return bw.pos;
 }
 
 /* Generates a synthetic VP9 interframe packet */
-static size_t generate_synthetic_interframe(uint8_t *buf, uint32_t width, uint32_t height)
+static size_t generate_synthetic_interframe(uint8_t *buf, uint32_t width, uint32_t height,
+                                            int log2_tile_cols)
 {
     memset(buf, 0, 1024);
     bitwriter_t bw = { .buf = buf, .pos = 0, .bit = 7 };
@@ -120,6 +138,11 @@ static size_t generate_synthetic_interframe(uint8_t *buf, uint32_t width, uint32
     write_bit(&bw, 1);     /* show_frame */
     write_bit(&bw, 0);     /* error_resilient */
 
+    write_bits(&bw, 0x01, 8); /* refresh_frame_flags: slot 0 */
+    write_bits(&bw, 0, 3);    /* ref_frame_idx[0] (LAST) */
+    write_bits(&bw, 0, 3);    /* ref_frame_idx[1] (GOLDEN) */
+    write_bits(&bw, 0, 3);    /* ref_frame_idx[2] (ALTREF) */
+
     write_bits(&bw, 128, 8); /* base_qindex */
     write_bit(&bw, 0);       /* y_dc_delta_q */
     write_bit(&bw, 0);       /* uv_dc_delta_q */
@@ -128,7 +151,8 @@ static size_t generate_synthetic_interframe(uint8_t *buf, uint32_t width, uint32
     write_bits(&bw, 32, 6);  /* filter_level */
     write_bits(&bw, 0, 3);   /* sharpness_level */
 
-    write_bit(&bw, 0);       /* log2_tile_cols */
+    for (int i = 0; i < log2_tile_cols; i++) write_bit(&bw, 1);
+    write_bit(&bw, 0);       /* log2_tile_cols terminator */
     write_bit(&bw, 0);       /* log2_tile_rows */
 
     align_byte(&bw);
@@ -145,9 +169,7 @@ static size_t generate_synthetic_interframe(uint8_t *buf, uint32_t width, uint32
     buf[bw.pos++] = 0x00;
     buf[bw.pos++] = 0x00;
 
-    /* Write tile data (64 bytes of zeros) */
-    memset(buf + bw.pos, 0, 64);
-    bw.pos += 64;
+    write_tiles(&bw, log2_tile_cols);
 
     return bw.pos;
 }
@@ -159,6 +181,7 @@ int main(int argc, char **argv)
     int width = 1280;
     int height = 720;
     int duration_sec = 0;
+    int log2_tile_cols = 0;
 
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--width") == 0) && i + 1 < argc) {
@@ -167,6 +190,8 @@ int main(int argc, char **argv)
             height = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--duration") == 0) && i + 1 < argc) {
             duration_sec = atoi(argv[++i]);
+        } else if ((strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--tile-cols") == 0) && i + 1 < argc) {
+            log2_tile_cols = atoi(argv[++i]);  /* log2: 1 = 2 tiles, 2 = 4 tiles */
         }
     }
 
@@ -188,8 +213,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    size_t keyframe_size = generate_synthetic_keyframe(keyframe_buf, width, height);
-    size_t interframe_size = generate_synthetic_interframe(interframe_buf, width, height);
+    size_t keyframe_size = generate_synthetic_keyframe(keyframe_buf, width, height, log2_tile_cols);
+    size_t interframe_size = generate_synthetic_interframe(interframe_buf, width, height, log2_tile_cols);
+    if (log2_tile_cols > 0) {
+        printf("Tile columns: %d (parsed in parallel)\n", 1 << log2_tile_cols);
+    }
 
     /* ─── Test 1: CPU Fallback Backend ─────────────────────────────────────── */
     printf("Running CPU Software Fallback Backend...\n");

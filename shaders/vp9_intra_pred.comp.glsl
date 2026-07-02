@@ -28,7 +28,7 @@ struct BlockData {
     uint dst_stride;
     
     uint dst_offset;
-    uint pad1;
+    int  qstep_dc;
     uint pad2;
     uint pad3;
 };

@@ -167,6 +167,17 @@ cvp9_err_t cvp9_export_buffer_alloc(cvp9_ctx_t *ctx, uint64_t size,
 void cvp9_export_buffer_free(cvp9_ctx_t *ctx, cvp9_export_buffer_t *buf);
 
 /**
+ * Arm a one-shot NV12 render target for the NEXT cvp9_decode*() call: the
+ * GPU packs the decoded frame as NV12 directly into `target` (a buffer from
+ * cvp9_export_buffer_alloc) as part of the decode submission — no CPU copy.
+ * Pass NULL to disarm. The target must stay alive until the frame is
+ * retrieved with cvp9_get_frame*().
+ *
+ * @return CVP9_ERR_UNSUPPORTED if the backend cannot write NV12 directly.
+ */
+cvp9_err_t cvp9_set_render_target(cvp9_ctx_t *ctx, const cvp9_export_buffer_t *target);
+
+/**
  * Return a human-readable string for an error code.
  */
 const char *cvp9_err_str(cvp9_err_t err);

@@ -22,6 +22,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 include(GNUInstallDirs)
 find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
 
 if(ENABLE_VAAPI)
     pkg_check_modules(LIBVA REQUIRED libva)
@@ -66,7 +67,7 @@ add_library(compute_vp9 SHARED
 target_include_directories(compute_vp9
     PUBLIC  include src
 )
-target_link_libraries(compute_vp9 PRIVATE m)
+target_link_libraries(compute_vp9 PRIVATE m Threads::Threads)
 
 # ─── Shader compilation (after target exists) ────────────────────────────────
 set(CVP9_SHADER_INSTALL_DIR "${CMAKE_INSTALL_FULL_DATADIR}/compute-vp9/shaders")
@@ -77,6 +78,7 @@ if(ENABLE_VULKAN AND GLSLC)
         shaders/vp9_mc.comp.glsl
         shaders/vp9_intra_pred.comp.glsl
         shaders/vp9_loopfilter.comp.glsl
+        shaders/vp9_nv12_pack.comp.glsl
     )
     add_dependencies(compute_vp9 VP9_SHADERS)
 

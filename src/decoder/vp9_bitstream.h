@@ -41,7 +41,7 @@ typedef struct {
     uint8_t            log2_tile_rows;
 
     /* Quantization */
-    int8_t             base_qindex;
+    int16_t            base_qindex;   /* 0..255 (int16 to survive delta_q math) */
     int8_t             y_dc_delta_q;
     int8_t             uv_dc_delta_q;
     int8_t             uv_ac_delta_q;
@@ -51,7 +51,8 @@ typedef struct {
     uint8_t            sharpness_level;
 
     /* Reference frames */
-    uint8_t            ref_frame_idx[3];
+    uint8_t            refresh_frame_flags;  /* bitmask: ref slots updated by this frame */
+    uint8_t            ref_frame_idx[3];     /* slot for LAST / GOLDEN / ALTREF */
     uint8_t            ref_frame_sign_bias[4];
 
     /* Segmentation */

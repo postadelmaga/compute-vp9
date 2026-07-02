@@ -9,6 +9,7 @@
 #include <strings.h>
 #include <unistd.h>
 #include "decoder/vp9_frame.h"
+#include "decoder/vp9_dequant.h"
 
 /* Helper: load SPIR-V shader module. Search order:
  *   1. $CVP9_SHADER_DIR (explicit override)
@@ -344,22 +345,26 @@ static void destroy_slot_output(vulkan_ctx_t *vk, vk_frame_slot_t *slot)
     }
 }
 
-/* Helper: allocate a descriptor set */
-static void bind_image_to_descriptor(VkDevice device, VkDescriptorSet set, uint32_t binding, VkImageView view, VkSampler sampler)
+/* Helper: bind an array of sampled images to one descriptor binding */
+static void bind_images_to_descriptor(VkDevice device, VkDescriptorSet set, uint32_t binding,
+                                      const VkImageView *views, uint32_t count, VkSampler sampler)
 {
-    VkDescriptorImageInfo image_info = {
-        .sampler = sampler,
-        .imageView = view,
-        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-    };
+    VkDescriptorImageInfo image_infos[8];
+    for (uint32_t i = 0; i < count && i < 8; i++) {
+        image_infos[i] = (VkDescriptorImageInfo){
+            .sampler = sampler,
+            .imageView = views[i],
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        };
+    }
     VkWriteDescriptorSet write = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = set,
         .dstBinding = binding,
         .dstArrayElement = 0,
-        .descriptorCount = 1,
+        .descriptorCount = count,
         .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .pImageInfo = &image_info
+        .pImageInfo = image_infos
     };
     vkUpdateDescriptorSets(device, 1, &write, 0, NULL);
 }
@@ -486,6 +491,52 @@ static VkResult ensure_buffers(vulkan_ctx_t *vk, uint32_t width, uint32_t height
     if (samplerRes != VK_SUCCESS) {
         fprintf(stderr, "Failed to create sampler: %d\n", samplerRes);
         return CVP9_ERR_GPU;
+    }
+
+    /* One-shot: move all reference images to SHADER_READ_ONLY so the first
+     * frame's MC can legally sample them (content undefined until the first
+     * refresh overwrites them) */
+    {
+        VkCommandBufferAllocateInfo init_alloc = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = vk->cmd_pool,
+            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            .commandBufferCount = 1
+        };
+        VkCommandBuffer icmd;
+        if (vkAllocateCommandBuffers(vk->device, &init_alloc, &icmd) != VK_SUCCESS) {
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        VkCommandBufferBeginInfo begin = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+        };
+        vkBeginCommandBuffer(icmd, &begin);
+        for (int i = 0; i < 8; i++) {
+            VkImageMemoryBarrier b = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = vk->ref_images[i],
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+                .srcAccessMask = 0,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+            };
+            vkCmdPipelineBarrier(icmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 0, 0, NULL, 0, NULL, 1, &b);
+        }
+        vkEndCommandBuffer(icmd);
+        VkSubmitInfo si = {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &icmd
+        };
+        vkQueueSubmit(vk->compute_queue, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(vk->compute_queue);
+        vkFreeCommandBuffers(vk->device, vk->cmd_pool, 1, &icmd);
     }
 
     res = create_buffer(vk->device, vk->phys_device, 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -686,12 +737,12 @@ cvp9_err_t vulkan_backend_init(void **ctx)
 
     vkGetDeviceQueue(vk->device, vk->compute_family, 0, &vk->compute_queue);
 
-    /* Descriptor Set Layout for MC (binding 0 is Image) */
+    /* Descriptor Set Layout for MC (binding 0 is an array of 3 reference images) */
     VkDescriptorSetLayoutBinding bindings_mc[3] = {
         {
             .binding = 0,
             .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .descriptorCount = 1,
+            .descriptorCount = 3,
             .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT
         },
         {
@@ -780,13 +831,16 @@ cvp9_err_t vulkan_backend_init(void **ctx)
     VkShaderModule mod_mc = load_shader_module(vk->device, "vp9_mc.comp.glsl.spv");
     VkShaderModule mod_intra = load_shader_module(vk->device, "vp9_intra_pred.comp.glsl.spv");
     VkShaderModule mod_loopfilter = load_shader_module(vk->device, "vp9_loopfilter.comp.glsl.spv");
+    VkShaderModule mod_nv12 = load_shader_module(vk->device, "vp9_nv12_pack.comp.glsl.spv");
 
     if (mod_idct == VK_NULL_HANDLE || mod_mc == VK_NULL_HANDLE ||
-        mod_intra == VK_NULL_HANDLE || mod_loopfilter == VK_NULL_HANDLE) {
+        mod_intra == VK_NULL_HANDLE || mod_loopfilter == VK_NULL_HANDLE ||
+        mod_nv12 == VK_NULL_HANDLE) {
         if (mod_idct) vkDestroyShaderModule(vk->device, mod_idct, NULL);
         if (mod_mc) vkDestroyShaderModule(vk->device, mod_mc, NULL);
         if (mod_intra) vkDestroyShaderModule(vk->device, mod_intra, NULL);
         if (mod_loopfilter) vkDestroyShaderModule(vk->device, mod_loopfilter, NULL);
+        if (mod_nv12) vkDestroyShaderModule(vk->device, mod_nv12, NULL);
         vkDestroyPipelineLayout(vk->device, vk->pipe_layout, NULL);
         vkDestroyDescriptorSetLayout(vk->device, vk->desc_layout_mc, NULL);
         vkDestroyDescriptorSetLayout(vk->device, vk->desc_layout_buffer, NULL);
@@ -823,11 +877,16 @@ cvp9_err_t vulkan_backend_init(void **ctx)
     pipeline_create_info.stage.module = mod_loopfilter;
     res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_loopfilter);
     if (res != VK_SUCCESS) fprintf(stderr, "[compute-vp9] Failed to create pipe_loopfilter: %d\n", res);
-    
+
+    pipeline_create_info.stage.module = mod_nv12;
+    res = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &vk->pipe_nv12);
+    if (res != VK_SUCCESS) fprintf(stderr, "[compute-vp9] Failed to create pipe_nv12: %d\n", res);
+
     vkDestroyShaderModule(vk->device, mod_idct, NULL);
     vkDestroyShaderModule(vk->device, mod_mc, NULL);
     vkDestroyShaderModule(vk->device, mod_intra, NULL);
     vkDestroyShaderModule(vk->device, mod_loopfilter, NULL);
+    vkDestroyShaderModule(vk->device, mod_nv12, NULL);
 
     /* Descriptor Pool — one set of descriptor sets per in-flight slot */
     VkDescriptorPoolSize pool_size[2] = {
@@ -882,8 +941,10 @@ cvp9_err_t vulkan_backend_init(void **ctx)
         slot->desc_intra = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
         slot->desc_idct = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
         slot->desc_lf = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
+        slot->desc_nv12 = allocate_desc_set(vk->device, vk->desc_pool, vk->desc_layout_buffer);
         if (slot->desc_mc == VK_NULL_HANDLE || slot->desc_intra == VK_NULL_HANDLE ||
-            slot->desc_idct == VK_NULL_HANDLE || slot->desc_lf == VK_NULL_HANDLE) {
+            slot->desc_idct == VK_NULL_HANDLE || slot->desc_lf == VK_NULL_HANDLE ||
+            slot->desc_nv12 == VK_NULL_HANDLE) {
             vulkan_backend_destroy(vk);
             return CVP9_ERR_GPU;
         }
@@ -931,6 +992,7 @@ void vulkan_backend_destroy(void *ctx)
         vkDestroyPipeline(vk->device, vk->pipe_mc, NULL);
         vkDestroyPipeline(vk->device, vk->pipe_intra, NULL);
         vkDestroyPipeline(vk->device, vk->pipe_loopfilter, NULL);
+        vkDestroyPipeline(vk->device, vk->pipe_nv12, NULL);
         vkDestroyPipelineLayout(vk->device, vk->pipe_layout, NULL);
 
         if (vk->desc_layout_mc != VK_NULL_HANDLE) {
@@ -994,6 +1056,11 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     vk_frame_slot_t *slot = &vk->slots[(vk->ring_head + vk->ring_count) % CVP9_INFLIGHT];
     slot->pts = pts;
 
+    /* Consume the one-shot NV12 direct render target, if armed */
+    slot->nv12_target = vk->pending_target;
+    slot->nv12_target_size = vk->pending_target_size;
+    vk->pending_target = VK_NULL_HANDLE;
+
     /* Upload coefficients (allocate only if size increases) */
     size_t coeff_size = pf->num_coeffs * sizeof(int16_t);
     if (coeff_size == 0) coeff_size = 256;
@@ -1051,6 +1118,10 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
         vkMapMemory(vk->device, slot->block_mem, 0, block_buf_size, 0, &slot->block_mapped);
     }
     if (pf->num_blocks > 0 && slot->block_mapped) {
+        /* Real dequantization steps from the frame's base qindex */
+        int32_t qstep_ac = vp9_ac_quant(pf->hdr.base_qindex, 0);
+        int32_t qstep_dc = vp9_dc_quant(pf->hdr.base_qindex, 0);
+
         gpu_block_data_t *mapped = (gpu_block_data_t *)slot->block_mapped;
         for (uint32_t i = 0; i < pf->num_blocks; i++) {
             const vp9_macroblock_info_t *block = &pf->blocks[i];
@@ -1059,18 +1130,24 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
             mapped[i].block_size = block->width;
             mapped[i].tx_size = 1 << (block->tx_size + 2);
             mapped[i].pred_mode = block->y_mode;
-            mapped[i].qstep = 128; /* constant for now */
+            mapped[i].qstep = qstep_ac;
             mapped[i].coeff_offset = block->coeff_offset;
             mapped[i].dst_stride = vk->width;
             mapped[i].dst_offset = block->y * vk->width + block->x;
-            mapped[i].pad1 = 0;
+            mapped[i].qstep_dc = qstep_dc;
             mapped[i].pad2 = 0;
             mapped[i].pad3 = 0;
         }
     }
 
-    /* Update this slot's descriptor sets (slot is idle, safe to write) */
-    bind_image_to_descriptor(vk->device, slot->desc_mc, 0, vk->ref_views[0], vk->ref_sampler);
+    /* Update this slot's descriptor sets (slot is idle, safe to write).
+     * MC reads the three active references (LAST/GOLDEN/ALTREF) resolved
+     * through the header's ref slot indices. */
+    VkImageView mc_views[3];
+    for (int i = 0; i < 3; i++) {
+        mc_views[i] = vk->ref_views[pf->hdr.ref_frame_idx[i] & 7];
+    }
+    bind_images_to_descriptor(vk->device, slot->desc_mc, 0, mc_views, 3, vk->ref_sampler);
     bind_buffer_to_descriptor(vk->device, slot->desc_mc, 1, vk->dst_buf, vk->dst_size);
     bind_buffer_to_descriptor(vk->device, slot->desc_mc, 2, slot->mv_buf, mv_size);
 
@@ -1086,6 +1163,12 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     bind_buffer_to_descriptor(vk->device, slot->desc_lf, 1, vk->dst_buf, vk->dst_size);
     bind_buffer_to_descriptor(vk->device, slot->desc_lf, 2, vk->dst_buf, vk->dst_size);
 
+    if (slot->nv12_target != VK_NULL_HANDLE) {
+        bind_buffer_to_descriptor(vk->device, slot->desc_nv12, 0, vk->dst_buf, vk->dst_size);
+        bind_buffer_to_descriptor(vk->device, slot->desc_nv12, 1, slot->nv12_target, slot->nv12_target_size);
+        bind_buffer_to_descriptor(vk->device, slot->desc_nv12, 2, vk->dst_buf, vk->dst_size);
+    }
+
     /* Record into the slot's persistent command buffer (implicit reset) */
     VkCommandBuffer cmd = slot->cmd;
 
@@ -1096,14 +1179,15 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     vkBeginCommandBuffer(cmd, &begin_info);
 
     /* Cross-frame hazard: the previous frame's command buffer still reads
-     * dst_buf (copy-out) when this one starts writing it. Same queue, so an
-     * execution barrier at the boundary is sufficient (WAR). */
+     * dst_buf (transfer copy-out and NV12 compute pack) when this one starts
+     * writing it. Same queue, so an execution barrier suffices (WAR). */
     VkMemoryBarrier war_barrier = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = 0,
         .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT
     };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &war_barrier, 0, NULL, 0, NULL);
 
     VkMemoryBarrier mem_barrier = {
@@ -1165,9 +1249,9 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
         .frame_width = vk->width,
         .frame_height = vk->height,
         .stride = vk->width,
-        .filter_level = 32,
-        .sharpness = 0,
-        .pass = 0 
+        .filter_level = pf->hdr.filter_level,
+        .sharpness = pf->hdr.sharpness_level,
+        .pass = 0
     };
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_loopfilter);
@@ -1191,6 +1275,21 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          0, 1, &mem_barrier, 0, NULL, 0, NULL);
 
+    /* 4. Direct-to-surface NV12 pack (zero CPU copies to the VA client) */
+    if (slot->nv12_target != VK_NULL_HANDLE) {
+        struct {
+            uint32_t width;
+            uint32_t height;
+        } pc_nv12 = { vk->width, vk->height };
+        uint32_t cw = (vk->width + 1) / 2;
+        uint32_t chh = (vk->height + 1) / 2;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_nv12);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_layout, 0, 1, &slot->desc_nv12, 0, NULL);
+        vkCmdPushConstants(cmd, vk->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_nv12), &pc_nv12);
+        vkCmdDispatch(cmd, (cw + 7) / 8, (chh + 7) / 8, 1);
+    }
+
     /* Pipeline barrier: compute write -> transfer read */
     VkMemoryBarrier transfer_barrier = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1208,25 +1307,9 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     };
     vkCmdCopyBuffer(cmd, vk->dst_buf, slot->output_buf, 1, &copy_region);
 
-    /* Update Reference frame slot 0 for subsequent inter frames */
-    /* Transition ref_image to TRANSFER_DST */
-    VkImageMemoryBarrier barrier = {0};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = vk->ref_images[0];
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-    barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         0, 0, NULL, 0, NULL, 1, &barrier);
+    /* Update the reference slots this frame refreshes (keyframe: all 8) so
+     * subsequent inter frames can predict from them */
+    uint32_t refresh = pf->hdr.refresh_frame_flags ? pf->hdr.refresh_frame_flags : 0x01;
 
     VkBufferImageCopy region = {0};
     region.bufferOffset = 0;
@@ -1239,23 +1322,45 @@ cvp9_err_t vulkan_decode_frame(void *ctx,
     region.imageOffset = (VkOffset3D){0, 0, 0};
     region.imageExtent = (VkExtent3D){vk->width, vk->height, 1};
 
-    vkCmdCopyBufferToImage(cmd, vk->dst_buf, vk->ref_images[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    for (int r = 0; r < 8; r++) {
+        if (!(refresh & (1u << r))) continue;
 
-    /* Transition to SHADER_READ_ONLY */
-    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         0, 0, NULL, 0, NULL, 1, &barrier);
+        VkImageMemoryBarrier barrier = {0};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;  /* discard: fully overwritten */
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = vk->ref_images[r];
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
-    /* Pipeline barrier: transfer write -> host read */
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &barrier);
+
+        vkCmdCopyBufferToImage(cmd, vk->dst_buf, vk->ref_images[r], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 0, NULL, 0, NULL, 1, &barrier);
+    }
+
+    /* Pipeline barrier: transfer + NV12 pack writes -> host read */
     VkMemoryBarrier host_barrier = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_HOST_READ_BIT
     };
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT,
                          0, 1, &host_barrier, 0, NULL, 0, NULL);
 
     vkEndCommandBuffer(cmd);
@@ -1391,7 +1496,8 @@ cvp9_err_t vulkan_export_buffer_alloc(void *ctx, uint64_t size, cvp9_export_buff
     void *mapped;
     int fd;
     VkResult res = create_exportable_buffer(vk, size,
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             &buf, &mem, &mapped, &fd);
     if (res != VK_SUCCESS) return CVP9_ERR_GPU;
     if (fd < 0) {
@@ -1406,6 +1512,22 @@ cvp9_err_t vulkan_export_buffer_alloc(void *ctx, uint64_t size, cvp9_export_buff
     out->size = size;
     out->priv_buf = (void *)buf;
     out->priv_mem = (void *)mem;
+    return CVP9_OK;
+}
+
+cvp9_err_t vulkan_set_render_target(void *ctx, const cvp9_export_buffer_t *target)
+{
+    vulkan_ctx_t *vk = (vulkan_ctx_t *)ctx;
+    if (!vk) return CVP9_ERR_INVALID_DATA;
+    if (!target) {
+        vk->pending_target = VK_NULL_HANDLE;
+        return CVP9_OK;
+    }
+    if (!vk->ext_dmabuf || !target->priv_buf || vk->pipe_nv12 == VK_NULL_HANDLE) {
+        return CVP9_ERR_UNSUPPORTED;
+    }
+    vk->pending_target = (VkBuffer)target->priv_buf;
+    vk->pending_target_size = target->size;
     return CVP9_OK;
 }
 

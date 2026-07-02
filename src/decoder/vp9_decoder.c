@@ -276,6 +276,18 @@ void cvp9_export_buffer_free(cvp9_ctx_t *ctx, cvp9_export_buffer_t *buf)
 #endif
 }
 
+cvp9_err_t cvp9_set_render_target(cvp9_ctx_t *ctx, const cvp9_export_buffer_t *target)
+{
+    if (!ctx) return CVP9_ERR_INVALID_DATA;
+
+#ifdef ENABLE_VULKAN
+    if (ctx->backend == CVP9_BACKEND_VULKAN)
+        return vulkan_set_render_target(ctx->backend_ctx, target);
+#endif
+
+    return CVP9_ERR_UNSUPPORTED;
+}
+
 cvp9_backend_t cvp9_active_backend(const cvp9_ctx_t *ctx)
 {
     return ctx ? ctx->backend : CVP9_BACKEND_CPU;
@@ -330,6 +342,27 @@ cvp9_err_t cvp9_decode_vaapi(cvp9_ctx_t *ctx,
     hdr->filter_level = pic_param->filter_level;
     hdr->sharpness_level = pic_param->sharpness_level;
     hdr->segmentation_enabled = pic_param->pic_fields.bits.segmentation_enabled;
+
+    /* Active reference slots (LAST/GOLDEN/ALTREF). Refresh flags are not in
+     * the VA parameters (the client manages the DPB via surfaces); with our
+     * internal reference pool we approximate by refreshing the LAST slot. */
+    hdr->ref_frame_idx[0] = pic_param->pic_fields.bits.last_ref_frame;
+    hdr->ref_frame_idx[1] = pic_param->pic_fields.bits.golden_ref_frame;
+    hdr->ref_frame_idx[2] = pic_param->pic_fields.bits.alt_ref_frame;
+    hdr->refresh_frame_flags = (hdr->frame_type == VP9_FRAME_KEY)
+        ? 0xFF
+        : (uint8_t)(1u << (pic_param->pic_fields.bits.last_ref_frame & 7));
+
+    /* base_qindex is not part of the VA-API picture parameters — it lives in
+     * the uncompressed frame header, so parse it from the bitstream */
+    {
+        vp9_bitreader_t br;
+        vp9_frame_header_t parsed;
+        vp9_bitreader_init(&br, data, size);
+        if (vp9_parse_frame_header(&br, &parsed) == 0) {
+            hdr->base_qindex = parsed.base_qindex;
+        }
+    }
 
     /* 2. Allocate or resize parsed_frame if dimensions changed */
     if (!ctx->parsed_frame || ctx->parsed_frame->hdr.width != hdr->width || ctx->parsed_frame->hdr.height != hdr->height) {

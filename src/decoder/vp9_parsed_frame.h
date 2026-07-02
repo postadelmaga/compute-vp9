@@ -7,10 +7,12 @@
 #include <stdbool.h>
 #include "vp9_bitstream.h"
 
-/* Motion vector matching GLSL ivec2 layout */
+/* Motion vector matching GLSL ivec4 layout */
 typedef struct {
-    int32_t x;  /* 1/8-pixel precision horizontal MV component */
-    int32_t y;  /* 1/8-pixel precision vertical MV component */
+    int32_t x;    /* 1/8-pixel precision horizontal MV component */
+    int32_t y;    /* 1/8-pixel precision vertical MV component */
+    int32_t ref;  /* reference selector: 0=LAST, 1=GOLDEN, 2=ALTREF */
+    int32_t pad;
 } cvp9_mv_t;
 
 /* Prediction and block configuration metadata */
@@ -54,6 +56,10 @@ typedef struct {
     uint8_t                *mi_height_grid;
     uint32_t                mi_grid_width;
     uint32_t                mi_grid_height;
+
+    /* Block index per ModeInfo cell (value = block index + 1, 0 = none) —
+     * O(1) neighbor lookup instead of scanning the block list */
+    uint32_t               *mi_block_grid;
 } vp9_parsed_frame_t;
 
 /* ── Constructor/Destructor ──────────────────────────────────────────────── */

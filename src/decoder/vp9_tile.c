@@ -5,6 +5,86 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
+
+/* One tile's byte range and MI rectangle, plus its private parse output */
+typedef struct {
+    const uint8_t              *data;
+    size_t                      size;
+    int                         mi_row_start, mi_row_end;
+    int                         mi_col_start, mi_col_end;
+    const vp9_entropy_probs_t  *probs;
+    vp9_parsed_frame_t         *pf;
+    int                         rc;
+} tile_job_t;
+
+static void *tile_worker(void *arg)
+{
+    tile_job_t *job = (tile_job_t *)arg;
+
+    vpx_reader r;
+    if (vpx_reader_init(&r, job->data, job->size)) {
+        job->rc = -1;
+        return NULL;
+    }
+    job->rc = vp9_decode_tile(&r, job->mi_row_start, job->mi_row_end,
+                              job->mi_col_start, job->mi_col_end,
+                              job->probs, job->pf);
+    return NULL;
+}
+
+/* Append one tile's private parse output into the frame-wide structures.
+ * Tile MI rectangles are disjoint, so grid copies never overlap. */
+static int merge_tile(vp9_parsed_frame_t *pf, const tile_job_t *job)
+{
+    const vp9_parsed_frame_t *tp = job->pf;
+
+    if (!vp9_parsed_frame_ensure_blocks(pf, tp->num_blocks) ||
+        !vp9_parsed_frame_ensure_coeffs(pf, tp->num_coeffs)) {
+        return -1;
+    }
+
+    uint32_t block_base = pf->num_blocks;
+    uint32_t coeff_base = pf->num_coeffs;
+
+    memcpy(&pf->coeffs[coeff_base], tp->coeffs, tp->num_coeffs * sizeof(*tp->coeffs));
+    pf->num_coeffs += tp->num_coeffs;
+
+    for (uint32_t i = 0; i < tp->num_blocks; i++) {
+        vp9_macroblock_info_t *b = &pf->blocks[block_base + i];
+        *b = tp->blocks[i];
+        b->coeff_offset += coeff_base;
+    }
+    pf->num_blocks += tp->num_blocks;
+
+    /* MI grids over the tile rectangle */
+    int mi_c0 = job->mi_col_start, mi_c1 = job->mi_col_end;
+    if (mi_c1 > (int)pf->mi_grid_width) mi_c1 = pf->mi_grid_width;
+    int mi_r1 = job->mi_row_end;
+    if (mi_r1 > (int)pf->mi_grid_height) mi_r1 = pf->mi_grid_height;
+    for (int r = job->mi_row_start; r < mi_r1; r++) {
+        uint32_t off = r * pf->mi_grid_width;
+        memcpy(&pf->mi_width_grid[off + mi_c0], &tp->mi_width_grid[off + mi_c0], mi_c1 - mi_c0);
+        memcpy(&pf->mi_height_grid[off + mi_c0], &tp->mi_height_grid[off + mi_c0], mi_c1 - mi_c0);
+        for (int c = mi_c0; c < mi_c1; c++) {
+            uint32_t v = tp->mi_block_grid[off + c];
+            pf->mi_block_grid[off + c] = v ? v + block_base : 0;
+        }
+    }
+
+    /* MV grid over the tile rectangle (4px units = 2 cells per MI unit) */
+    int gx0 = job->mi_col_start * 2, gx1 = job->mi_col_end * 2;
+    if (gx1 > (int)pf->mv_grid_width) gx1 = pf->mv_grid_width;
+    int gy1 = job->mi_row_end * 2;
+    if (gy1 > (int)pf->mv_grid_height) gy1 = pf->mv_grid_height;
+    for (int gy = job->mi_row_start * 2; gy < gy1; gy++) {
+        uint32_t off = gy * pf->mv_grid_width;
+        memcpy(&pf->mv_grid[off + gx0], &tp->mv_grid[off + gx0],
+               (gx1 - gx0) * sizeof(cvp9_mv_t));
+    }
+
+    return 0;
+}
 
 int vp9_decode_tiles(const vp9_frame_header_t *hdr,
                      const uint8_t *data, size_t size,
@@ -22,11 +102,16 @@ int vp9_decode_tiles(const vp9_frame_header_t *hdr,
 
     int tile_cols = 1 << hdr->log2_tile_cols;
     int tile_rows = 1 << hdr->log2_tile_rows;
+    int num_tiles = tile_cols * tile_rows;
 
     const uint8_t *curr_ptr = data;
     const uint8_t *data_end = data + size;
 
-    /* Loop through tiles in raster order */
+    /* Scan tile size headers to locate every tile's byte range */
+    tile_job_t jobs[64];
+    if (num_tiles > 64) return -1;
+
+    int n = 0;
     for (int row = 0; row < tile_rows; row++) {
         int mi_row_start = ((row * sb_rows) >> hdr->log2_tile_rows) << 3;
         int mi_row_end = (((row + 1) * sb_rows) >> hdr->log2_tile_rows) << 3;
@@ -43,36 +128,66 @@ int vp9_decode_tiles(const vp9_frame_header_t *hdr,
                 tile_size = data_end - curr_ptr;
             } else {
                 /* Non-last tiles have a 4-byte size header */
-                if (curr_ptr + 4 > data_end) {
-                    return -1;
-                }
+                if (curr_ptr + 4 > data_end) return -1;
                 tile_size = ((size_t)curr_ptr[0] << 24) |
                             ((size_t)curr_ptr[1] << 16) |
                             ((size_t)curr_ptr[2] << 8)  |
                             ((size_t)curr_ptr[3]);
                 curr_ptr += 4;
             }
+            if (curr_ptr + tile_size > data_end) return -1;
 
-            if (curr_ptr + tile_size > data_end) {
-                return -1;
-            }
-
-            /* Initialize range coder for this tile */
-            vpx_reader r;
-            if (vpx_reader_init(&r, curr_ptr, tile_size)) {
-                return -1;
-            }
-
-            /* Decode tile slice */
-            if (vp9_decode_tile(&r, mi_row_start, mi_row_end, mi_col_start, mi_col_end, probs, pf) != 0) {
-                return -1;
-            }
-
+            jobs[n] = (tile_job_t){
+                .data = curr_ptr, .size = tile_size,
+                .mi_row_start = mi_row_start, .mi_row_end = mi_row_end,
+                .mi_col_start = mi_col_start, .mi_col_end = mi_col_end,
+                .probs = probs, .pf = NULL, .rc = -1,
+            };
+            n++;
             curr_ptr += tile_size;
         }
     }
 
-    return 0;
+    /* Single tile: parse straight into the output frame, no threads */
+    if (n == 1) {
+        vpx_reader r;
+        if (vpx_reader_init(&r, jobs[0].data, jobs[0].size)) return -1;
+        return vp9_decode_tile(&r, jobs[0].mi_row_start, jobs[0].mi_row_end,
+                               jobs[0].mi_col_start, jobs[0].mi_col_end, probs, pf);
+    }
+
+    /* Multiple tiles: entropy decoding is independent per tile by spec —
+     * parse each into a private arena on its own thread, then merge in
+     * raster order (left-neighbor context resets at tile boundaries) */
+    pthread_t threads[64];
+    int rc = 0;
+
+    for (int i = 0; i < n; i++) {
+        jobs[i].pf = vp9_parsed_frame_alloc(hdr->width, hdr->height);
+        if (!jobs[i].pf) rc = -1;
+        else memcpy(&jobs[i].pf->hdr, hdr, sizeof(*hdr));
+    }
+
+    if (rc == 0) {
+        for (int i = 0; i < n; i++) {
+            if (pthread_create(&threads[i], NULL, tile_worker, &jobs[i]) != 0) {
+                /* Thread creation failed: run inline */
+                tile_worker(&jobs[i]);
+                threads[i] = 0;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            if (threads[i]) pthread_join(threads[i], NULL);
+        }
+        for (int i = 0; i < n && rc == 0; i++) {
+            if (jobs[i].rc != 0 || merge_tile(pf, &jobs[i]) != 0) rc = -1;
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        vp9_parsed_frame_free(jobs[i].pf);
+    }
+    return rc;
 }
 
 int vp9_decode_tile(vpx_reader *r,
@@ -175,13 +290,11 @@ void vp9_decode_partition(vpx_reader *r, int mi_row, int mi_col, int size_mi,
 static const vp9_macroblock_info_t *find_block_at(const vp9_parsed_frame_t *pf, int x, int y)
 {
     if (x < 0 || y < 0) return NULL;
-    for (uint32_t i = 0; i < pf->num_blocks; i++) {
-        const vp9_macroblock_info_t *b = &pf->blocks[i];
-        if (x >= b->x && x < b->x + b->width && y >= b->y && y < b->y + b->height) {
-            return b;
-        }
-    }
-    return NULL;
+    uint32_t mi_c = (uint32_t)x >> 3;
+    uint32_t mi_r = (uint32_t)y >> 3;
+    if (mi_c >= pf->mi_grid_width || mi_r >= pf->mi_grid_height) return NULL;
+    uint32_t v = pf->mi_block_grid[mi_r * pf->mi_grid_width + mi_c];
+    return v ? &pf->blocks[v - 1] : NULL;
 }
 
 static int get_y_mode_context(const vp9_macroblock_info_t *above, const vp9_macroblock_info_t *left)
@@ -306,12 +419,15 @@ void vp9_decode_block(vpx_reader *r, int mi_row, int mi_col,
         int end_gx = (block->x + block->width) / 4;
         int end_gy = (block->y + block->height) / 4;
 
+        int ref_sel = block->ref_frame[0] > 0 ? block->ref_frame[0] - 1 : 0;
+        if (ref_sel > 2) ref_sel = 2;
         for (int gy = start_gy; gy < end_gy; gy++) {
             for (int gx = start_gx; gx < end_gx; gx++) {
                 if (gx < (int)pf->mv_grid_width && gy < (int)pf->mv_grid_height) {
                     uint32_t idx = gy * pf->mv_grid_width + gx;
                     pf->mv_grid[idx].x = block->mv[0][0];
                     pf->mv_grid[idx].y = block->mv[0][1];
+                    pf->mv_grid[idx].ref = ref_sel;
                 }
             }
         }
@@ -354,7 +470,7 @@ void vp9_decode_block(vpx_reader *r, int mi_row, int mi_col,
         }
     }
 
-    /* Save block dimensions to ModeInfo grid for neighbor context calculation */
+    /* Save block dimensions + index to ModeInfo grid for O(1) neighbor lookup */
     int end_mi_row = mi_row + height_mi;
     int end_mi_col = mi_col + width_mi;
     for (int r = mi_row; r < end_mi_row; r++) {
@@ -363,6 +479,7 @@ void vp9_decode_block(vpx_reader *r, int mi_row, int mi_col,
                 uint32_t idx = r * pf->mi_grid_width + c;
                 pf->mi_width_grid[idx] = block->width;
                 pf->mi_height_grid[idx] = block->height;
+                pf->mi_block_grid[idx] = pf->num_blocks + 1;
             }
         }
     }

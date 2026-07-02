@@ -23,12 +23,12 @@ typedef struct {
     uint32_t tx_size;
     
     uint32_t pred_mode;
-    int32_t  qstep;
+    int32_t  qstep;       /* AC quantizer step */
     uint32_t coeff_offset;
     uint32_t dst_stride;
-    
+
     uint32_t dst_offset;
-    uint32_t pad1;
+    int32_t  qstep_dc;    /* DC quantizer step (coefficient 0) */
     uint32_t pad2;
     uint32_t pad3;
 } gpu_block_data_t;
@@ -72,6 +72,12 @@ typedef struct {
     VkDescriptorSet  desc_intra;
     VkDescriptorSet  desc_idct;
     VkDescriptorSet  desc_lf;
+    VkDescriptorSet  desc_nv12;
+
+    /* Optional caller-owned NV12 buffer written by the GPU at the end of
+     * the decode (direct-to-surface, no CPU repack) */
+    VkBuffer         nv12_target;
+    VkDeviceSize     nv12_target_size;
 } vk_frame_slot_t;
 
 typedef struct {
@@ -90,6 +96,7 @@ typedef struct {
     VkPipeline       pipe_mc;
     VkPipeline       pipe_intra;
     VkPipeline       pipe_loopfilter;
+    VkPipeline       pipe_nv12;
     VkPipelineLayout pipe_layout;
     VkDescriptorPool desc_pool;
     VkDescriptorSetLayout desc_layout_mc;
@@ -123,6 +130,10 @@ typedef struct {
     uint32_t         ring_head;   /* oldest pending slot */
     uint32_t         ring_count;  /* number of pending slots */
 
+    /* One-shot NV12 render target for the next decode */
+    VkBuffer         pending_target;
+    VkDeviceSize     pending_target_size;
+
     /* Command infrastructure */
     VkCommandPool    cmd_pool;
 } vulkan_ctx_t;
@@ -145,5 +156,10 @@ cvp9_err_t vulkan_get_frame_dmabuf(void *ctx, cvp9_dmabuf_frame_t *out);
 
 cvp9_err_t vulkan_export_buffer_alloc(void *ctx, uint64_t size, cvp9_export_buffer_t *out);
 void       vulkan_export_buffer_free(void *ctx, cvp9_export_buffer_t *buf);
+
+/* Arm a one-shot NV12 render target (an export buffer from
+ * vulkan_export_buffer_alloc) for the next vulkan_decode_frame: the GPU
+ * packs the decoded frame into it directly, no CPU repack needed. */
+cvp9_err_t vulkan_set_render_target(void *ctx, const cvp9_export_buffer_t *target);
 
 #endif /* ENABLE_VULKAN */

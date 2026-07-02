@@ -30,7 +30,7 @@ struct BlockData {
     uint dst_stride;
     
     uint dst_offset;
-    uint pad1;
+    int  qstep_dc;
     uint pad2;
     uint pad3;
 };
@@ -665,7 +665,7 @@ void main()
         int arr[4];
         if (tid < 4) {
             for (int row = 0; row < 4; row++) {
-                arr[row] = int(coeff[b.coeff_offset + row * 4 + tid]) * b.qstep;
+                arr[row] = int(coeff[b.coeff_offset + row * 4 + tid]) * ((row == 0 && tid == 0u) ? b.qstep_dc : b.qstep);
             }
             idct4_c(arr, arr);
             for (int row = 0; row < 4; row++) {
@@ -696,7 +696,7 @@ void main()
         int arr[8];
         if (tid < 8) {
             for (int row = 0; row < 8; row++) {
-                arr[row] = int(coeff[b.coeff_offset + row * 8 + tid]) * b.qstep;
+                arr[row] = int(coeff[b.coeff_offset + row * 8 + tid]) * ((row == 0 && tid == 0u) ? b.qstep_dc : b.qstep);
             }
             idct8_c(arr, arr);
             for (int row = 0; row < 8; row++) {
@@ -727,7 +727,7 @@ void main()
         int arr[16];
         if (tid < 16) {
             for (int row = 0; row < 16; row++) {
-                arr[row] = int(coeff[b.coeff_offset + row * 16 + tid]) * b.qstep;
+                arr[row] = int(coeff[b.coeff_offset + row * 16 + tid]) * ((row == 0 && tid == 0u) ? b.qstep_dc : b.qstep);
             }
             idct16_c(arr, arr);
             for (int row = 0; row < 16; row++) {
@@ -758,7 +758,7 @@ void main()
         int arr[32];
         if (tid < 32) {
             for (int row = 0; row < 32; row++) {
-                arr[row] = int(coeff[b.coeff_offset + row * 32 + tid]) * b.qstep;
+                arr[row] = int(coeff[b.coeff_offset + row * 32 + tid]) * ((row == 0 && tid == 0u) ? b.qstep_dc : b.qstep);
             }
             idct32_c(arr, arr);
             for (int row = 0; row < 32; row++) {

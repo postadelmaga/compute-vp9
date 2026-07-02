@@ -138,19 +138,21 @@ Select the decode GPU with `CVP9_GPU_VENDOR=intel|nvidia|amd`.
 
 | Component | Status |
 |---|---|
-| Bitstream parser (frame header) | ✅ Implemented |
-| VP9 4×4 IDCT shader | ✅ Implemented (1D fast butterfly) |
-| VP9 8/16/32 IDCT shaders | 🚧 TODO |
-| Motion compensation shader | ✅ Skeleton |
+| Bitstream parser (frame header) | ✅ Implemented (simplified dialect — real streams not yet parsed) |
+| VP9 4×4/8×8/16×16/32×32 IDCT shaders | ✅ Implemented (1D fast butterfly) |
+| Motion compensation shader | ✅ 8-tap subpel (16 phases), LAST/GOLDEN/ALTREF, ref pool refresh — luma only |
 | Intra prediction shader | ✅ Skeleton (DC/V/H/TM) |
 | Loop filter shader | ✅ Skeleton (2D dispatch) |
 | Vulkan backend init | ✅ Implemented |
 | Pipelined decode (3 frames in flight) | ✅ Implemented |
 | DMA-BUF export (cross-GPU zero-copy) | ✅ Implemented |
+| GPU NV12 pack direct into VA surfaces | ✅ Implemented (no CPU copies to the client) |
+| Dequantization (spec qindex tables) | ✅ Implemented |
 | VA-API entrypoint | ✅ Implemented (Chrome-compatible: `vaQuerySurfaceAttributes`, `vaCreateSurfaces2`, `vaExportSurfaceHandle`) |
 | Entropy decoder (CPU) | 🚧 Partial |
-| Tile/MB parser | 🚧 Partial |
-| Full decode pipeline (correct output) | 🚧 TODO — shaders are skeletons, expect corrupted video |
+| Tile/MB parser | 🚧 Partial (multi-threaded across tile columns, O(1) neighbor lookup) |
+| Chrome integration | ✅ Driver accepted: "Video Decode: Hardware accelerated", VP9 profile0/2 listed in chrome://gpu |
+| Full decode pipeline (correct output) | 🚧 TODO — real bitstreams are rejected by the parser (not yet spec-conformant), Chrome falls back to software |
 
 ## Contributing
 

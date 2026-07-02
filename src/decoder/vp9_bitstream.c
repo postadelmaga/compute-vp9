@@ -65,10 +65,18 @@ int vp9_parse_frame_header(vp9_bitreader_t *br, vp9_frame_header_t *hdr)
         /* Frame size */
         hdr->width  = vp9_read_bits(br, 16) + 1;
         hdr->height = vp9_read_bits(br, 16) + 1;
+
+        /* Keyframes reset the whole reference pool */
+        hdr->refresh_frame_flags = 0xFF;
+    } else {
+        /* Reference management */
+        hdr->refresh_frame_flags = vp9_read_bits(br, 8);
+        for (int i = 0; i < 3; i++)
+            hdr->ref_frame_idx[i] = vp9_read_bits(br, 3);
     }
 
     /* Quantization */
-    hdr->base_qindex    = (int8_t)vp9_read_bits(br, 8);
+    hdr->base_qindex    = (int16_t)vp9_read_bits(br, 8);
     hdr->y_dc_delta_q   = vp9_read_bit(br) ? (int8_t)vp9_read_bits(br, 5) : 0;
     hdr->uv_dc_delta_q  = vp9_read_bit(br) ? (int8_t)vp9_read_bits(br, 5) : 0;
     hdr->uv_ac_delta_q  = vp9_read_bit(br) ? (int8_t)vp9_read_bits(br, 5) : 0;
